@@ -61,6 +61,7 @@ def detect_dice_scores(image_path: str, output_path: str = "result_final.jpg"):
             continue
 
         # Filter 2: Shape (Square-ish)
+        ### TO-DO: It can be the source of the problems: we can also use cv2.minAreaRect()
         x, y, w, h = cv2.boundingRect(cnt)
         aspect_ratio = float(w) / h
         
@@ -80,6 +81,10 @@ def detect_dice_scores(image_path: str, output_path: str = "result_final.jpg"):
 
         # --- ROI Extraction for Pips ---
         # We look inside the bounding box + a small margin
+        # TODO:
+        # 1. maskowanie 
+        # 2. filtrowanie oczek po powierzchni i kształcie
+        # 3. prostowanie kostki (deskewing)
         roi = gray[y:y+h, x:x+w]
         
         # Local threshold for pips
