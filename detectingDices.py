@@ -25,12 +25,16 @@ def detect_dice_scores(image_path: str, output_path: str = "result_final.jpg"):
 
     # 3. Blurring & Thresholding
     # Gaussian blur to smooth the fabric texture
-    blurred = cv2.GaussianBlur(gray_eq, (7, 7), 0)
+    #blurred = cv2.GaussianBlur(gray_eq, (7, 7), 0)
+    blurred = cv2.medianBlur(gray_eq, 9)
 
     # Global Binary Threshold
     # Since we equalized the histogram, the background is now a uniform mid-grey
     # and dice are bright white. We can safely pick a high threshold (e.g., 180-200).
-    _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+    #_, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+
+
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 91, 8)
 
     # Morphological Cleanup
     # Open: removes small white noise points
@@ -157,13 +161,30 @@ def detect_dice_scores(image_path: str, output_path: str = "result_final.jpg"):
             cv2.circle(output_img, (px, py), 3, (255, 0, 0), -1)
 
     print(f"Total Score: {total_score}")
-    cv2.imwrite(output_path, output_img)
-    print(f"Saved result to {output_path}")
+    
+    # Preparing a summary image
+    def prepare_for_stack(image, title):
+        if len(image.shape) == 2:
+            display = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:
+            display = image.copy()
+        cv2.putText(display, title, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.7, (0, 255, 255), 3)
+        return display
 
-    # Optional: Display
-    # cv2.imshow("Result", output_img)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
+    s1 = prepare_for_stack(img, "1. Original")
+    s2 = prepare_for_stack(gray, "2. Grayscale")
+    s3 = prepare_for_stack(gray_eq, "3. CLAHE")
+    s4 = prepare_for_stack(blurred, "4. Gaussian Blur")
+    s5 = prepare_for_stack(thresh, "5. Threshold/Morph")
+    s6 = prepare_for_stack(output_img, "6. Final Result")
+
+    # Stacking all 6 stages images
+    combined_debug = np.hstack((s1, s2, s3, s4, s5, s6))
+    
+    cv2.imwrite("processing_steps_all.jpg", combined_debug)
+    cv2.imwrite(output_path, output_img)
+    print(f"Saved debug collage to processing_steps_all.jpg")
+    print(f"Saved final result to {output_path}")
 
 if __name__ == "__main__":
-    detect_dice_scores("data/img_1(dices_on_grey_background_with_shadows).jpg")
+    detect_dice_scores("/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/kostki_shadow/IMG_0329.jpg")
