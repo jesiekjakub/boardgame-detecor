@@ -187,4 +187,4 @@ def detect_dice_scores(image_path: str, output_path: str = "result_final.jpg"):
     print(f"Saved final result to {output_path}")
 
 if __name__ == "__main__":
-    detect_dice_scores("/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/kostki_shadow/IMG_0329.jpg")
+    detect_dice_scores("data/img_1(dices_on_grey_background_with_shadows).jpg")
