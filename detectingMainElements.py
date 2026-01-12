@@ -1,13 +1,9 @@
 import cv2
 import numpy as np
 
-# --- Helper Functions ---
+# --- Helper Functions (Unchanged) ---
 
 def stack_images(scale, img_list, cols):
-    """
-    Stacks multiple images into a grid layout while maintaining their 
-    original aspect ratios using padding instead of stretching.
-    """
     unit_h, unit_w = 400, 400 
     rows = (len(img_list) + cols - 1) // cols
     processed_imgs = []
@@ -52,7 +48,6 @@ def stack_images(scale, img_list, cols):
     return np.vstack(horiz_rows)
 
 def add_label(img, label):
-    """Helper to add a text label to an image."""
     labeled_img = img.copy()
     if labeled_img.ndim == 2:
         labeled_img = cv2.cvtColor(labeled_img, cv2.COLOR_GRAY2BGR)
@@ -61,19 +56,11 @@ def add_label(img, label):
     return labeled_img
 
 def get_warped_rect(image, contour, padding=0):
-    """
-    Takes a contour (or set of points), finds the minimum area rotated rectangle,
-    and warps the image to extract that rectangle axis-aligned.
-    """
-    # 1. Get rotated rectangle
     rect = cv2.minAreaRect(contour)
     center, (w, h), angle = rect
-
-    # 2. Get the 4 corners of the rotated rect
     box = cv2.boxPoints(rect)
     box = np.intp(box)
 
-    # 3. Reorder points to: top-left, top-right, bottom-right, bottom-left
     pts = box.astype("float32")
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1)
@@ -83,7 +70,6 @@ def get_warped_rect(image, contour, padding=0):
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
     
-    # 4. Compute width and height
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
@@ -92,17 +78,60 @@ def get_warped_rect(image, contour, padding=0):
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
-    # 5. Perspective transform
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     src = np.array([tl, tr, br, bl], dtype="float32")
 
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     
-    if warped.shape[1]*0.9 > warped.shape[0]: 
+    # Ensure portrait orientation for consistency
+    if warped.shape[1] * 0.9  > warped.shape[0]: 
         warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
 
     return warped, box
+
+def warp_from_points(image, pts):
+    """
+    Warps the image using exactly 4 points (pts). 
+    Unlike minAreaRect, this handles perspective distortion (trapezoids).
+    """
+    # Reshape to (4, 2)
+    pts = pts.reshape(4, 2).astype("float32")
+    
+    # Order points: tl, tr, br, bl
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+    
+    rect[0] = pts[np.argmin(s)]      # Top-Left
+    rect[2] = pts[np.argmax(s)]      # Bottom-Right
+    rect[1] = pts[np.argmin(diff)]   # Top-Right
+    rect[3] = pts[np.argmax(diff)]   # Bottom-Left
+    
+    (tl, tr, br, bl) = rect
+    
+    # Compute width (max of top and bottom widths)
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    # Compute height (max of left and right heights)
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    # Destination points (Square/Rectangle)
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    # Compute the Perspective Transform Matrix
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    
+    return warped, rect.astype(int)
 
 # --- Main Detection Function ---
 
@@ -117,41 +146,66 @@ def detect_game_elements_visualized(image):
     blur = cv2.GaussianBlur(image, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     
+    # --- EDGE DETECTION (Moved up for Paper Detection) ---
+    gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
+    v = np.median(blur)
+    lower_canny = int(max(0, (1.0 - 0.33) * v))
+    upper_canny = int(min(255, (1.0 + 0.33) * v))
+    edges = cv2.Canny(blur, lower_canny, upper_canny)
+    
     kernel_small = np.ones((3, 3), np.uint8)
-    kernel_medium = np.ones((5, 5), np.uint8)
+    # Dilate edges to close small gaps in the paper border
+    edges_dilated = cv2.dilate(edges, kernel_small, iterations=2)
+    visuals.append(add_label(edges_dilated, "2. Edges (Dilated)"))
 
     # ============================================
-    # STAGE 1: DETECT PAPERS
+    # STAGE 1: DETECT PAPERS (Canny + Hull Strategy)
     # ============================================
-    lower_white = np.array([0, 0, 140])
-    upper_white = np.array([180, 15, 255])
-    mask_white = cv2.inRange(hsv, lower_white, upper_white)
+    paper_contours, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    mask_white_closed = cv2.morphologyEx(mask_white, cv2.MORPH_CLOSE, kernel_medium, iterations=2)
-    visuals.append(add_label(mask_white_closed, "2. Paper Mask"))
+    paper_occupancy_mask = np.zeros(image.shape[:2], dtype=np.uint8)
     
-    paper_occupancy_mask = np.zeros_like(mask_white)
-
-    contours, _ = cv2.findContours(mask_white_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contours:
+    for cnt in paper_contours:
         area = cv2.contourArea(cnt)
-        if area > 3000: 
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        
+        # 1. Filter by Area (Must be large enough to be a paper)
+        if area > 5000: 
+            # 2. Convex Hull (The key to your idea: simplifies the boundary)
             hull = cv2.convexHull(cnt)
-            solidity = float(area) / cv2.contourArea(hull)
-
-            if len(approx) == 4 and solidity > 0.90:
-                warped_paper, box_points = get_warped_rect(image, cnt)
-                results["papers"].append(warped_paper)
-                cv2.drawContours(output_img, [box_points], 0, (0, 255, 0), 2)
-                cv2.drawContours(paper_occupancy_mask, [cnt], -1, 255, -1)
+            
+            # 3. Approximate Polygon (Find the corners of the Hull)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.04 * peri, True)
+            
+            # 4. Check for 4 Corners
+            if len(approx) == 4:
+                # 5. Aspect Ratio Check (1.3 to 1.5)
+                # Get lengths of adjacent sides to calculate ratio
+                pts = approx.reshape(4, 2)
+                
+                # Calculate distances: (pt0-pt1), (pt1-pt2)
+                d1 = np.linalg.norm(pts[0] - pts[1])
+                d2 = np.linalg.norm(pts[1] - pts[2])
+                
+                # Aspect ratio is always > 1 (Long / Short)
+                aspect_ratio = max(d1, d2) / min(d1, d2) if min(d1, d2) > 0 else 0
+                
+                if 1.3 < aspect_ratio < 1.6: # Expanded slightly to 1.6 to be safe
+                    # Correct! This is a paper
+                    warped_paper, box_points = get_warped_rect(image, hull)
+                    results["papers"].append(warped_paper)
+                    
+                    # Draw Visualization
+                    cv2.drawContours(output_img, [hull], -1, (0, 255, 0), 2) # Green hull
+                    cv2.drawContours(output_img, [np.intp(box_points)], 0, (0, 0, 255), 2) # Red rect
+                    
+                    # Mark this area as occupied so Wheel/Other stages ignore it
+                    cv2.drawContours(paper_occupancy_mask, [hull], -1, 255, -1)
 
     # ============================================
-    # STAGE 2: WHEEL OF FORTUNE (Smart Distance Filtering)
+    # STAGE 2: WHEEL OF FORTUNE (Rotation Fixed)
     # ============================================
-    # 1. Color Masking (Strict)
+    # 1. Color Masking
     lower_yellow = np.array([20, 70, 80])
     upper_yellow = np.array([35, 255, 255])
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
@@ -164,106 +218,80 @@ def detect_game_elements_visualized(image):
     
     # 2. Subtract Papers
     mask_wheel_no_papers = cv2.bitwise_and(mask_wheel_raw, mask_wheel_raw, mask=cv2.bitwise_not(paper_occupancy_mask))
-    
-    # 3. Minimal Cleanup (Only Open to remove sparkles, NO Dilation)
     mask_wheel_cleaned = cv2.morphologyEx(mask_wheel_no_papers, cv2.MORPH_OPEN, kernel_small, iterations=1)
     
-    # 4. Smart Point Analysis
+    # 3. Smart Point Analysis
     wheel_pixels = cv2.findNonZero(mask_wheel_cleaned)
     vis_wheel = np.zeros_like(mask_wheel_cleaned)
 
     if wheel_pixels is not None:
-        wheel_pixels = wheel_pixels.squeeze() # (N, 2)
+        wheel_pixels = wheel_pixels.squeeze() 
         
-        # A. Calculate Median Center (More robust than Mean)
-        # We use median to avoid outliers pulling the center point away
         median_x = np.median(wheel_pixels[:, 0])
         median_y = np.median(wheel_pixels[:, 1])
         center = np.array([median_x, median_y])
         
-        # B. Calculate Euclidean Distances
-        # shape (N,)
         distances = np.linalg.norm(wheel_pixels - center, axis=1)
-        
-        # C. Sort points by distance
-        # We want to keep the "core" points that rise steadily in distance
         sorted_indices = np.argsort(distances)
         sorted_dists = distances[sorted_indices]
         
-        # D. Detect "Knee" or "Gap" in the distance curve
-        # If we encounter a large jump in distance, everything after is likely noise
-        # Calculate the difference between consecutive points' distances
-        diffs = np.diff(sorted_dists)
-        
-        # Threshold: We look for a gap larger than X pixels. 
-        # Since pixels in a filled shape are contiguous, gaps > 5-10px usually mean a separate object.
-        gap_threshold = 10.0 
-        
-        # Find the first index where the gap is too large
-        cutoff_index = len(sorted_dists) # Default: keep all
-        
-        # We search from the 'middle' outwards to avoid being triggered by small gaps in the core
-        start_search = int(len(diffs) * 0.5) 
-        for i in range(start_search, len(diffs)):
-            if diffs[i] > gap_threshold:
-                cutoff_index = i + 1 # +1 because diff array is 1 shorter
-                break
-        
-        # Alternative robustness: IQR Clip
-        # If the gap logic fails (e.g. noise is uniform), use statistics
+        # Robust IQR Filtering
         q1 = np.percentile(sorted_dists, 25)
         q3 = np.percentile(sorted_dists, 75)
         iqr = q3 - q1
-        iqr_limit = q3 + 1.5 * iqr
+        limit = q3 + 1.5 * iqr
         
-        # Combine strategies: take the stricter of the two limits
-        valid_indices = sorted_indices[:cutoff_index]
-        
-        # Re-filter based on IQR just in case the gap wasn't found but points are huge
-        final_points = []
-        for idx in valid_indices:
-            if distances[idx] < iqr_limit:
-                final_points.append(wheel_pixels[idx])
-        
-        final_points = np.array(final_points)
+        valid_indices = sorted_indices[sorted_dists < limit]
+        final_points = wheel_pixels[valid_indices]
 
-        # Visualization of filtered points
+        # Visualization
         for p in final_points:
              cv2.circle(vis_wheel, (int(p[0]), int(p[1])), 1, 255, -1)
         visuals.append(add_label(vis_wheel, "3. Wheel (Smart Filter)"))
 
-        # 5. Extract the "Outermost 4 Points" (Board Corners)
         if len(final_points) >= 4:
-            # We calculate the MinAreaRect of the CLEANED cluster.
-            # This implicitly finds the 4 best corners that enclose the board.
+            # A. Get Convex Hull of the filtered cluster
             hull = cv2.convexHull(final_points.astype(np.int32))
             
-            # Check aspect ratio to ensure it's somewhat square-ish (board)
-            rect = cv2.minAreaRect(hull)
-            (w, h) = rect[1]
-            if w > 0 and h > 0:
-                aspect = min(w,h) / max(w,h)
-                if aspect > 0.8: # Loose check, boards are usually squares
-                    warped_wheel, box_points = get_warped_rect(image, hull)
-                    results["wheel"] = warped_wheel
-                    cv2.drawContours(output_img, [np.intp(box_points)], 0, (0, 255, 255), 2)
+            # B. Approximate Polygon to find corners
+            peri = cv2.arcLength(hull, True)
+            # 0.04 is a good standard, but for "round" corners sometimes 0.05 is safer
+            approx = cv2.approxPolyDP(hull, 0.04 * peri, True)
+            
+            # C. Check if we found 4 corners
+            if len(approx) == 4:
+                # Perfect! We have 4 corners. Use them directly.
+                warped_wheel, box_points = warp_from_points(image, approx)
+                results["wheel"] = warped_wheel
+                
+                # Draw the detected polygon (Yellow)
+                cv2.drawContours(output_img, [box_points], 0, (0, 255, 255), 3)
+            
+            else:
+                # Fallback: If approxPolyDP fails (e.g. returns 5 points due to noise),
+                # we fall back to minAreaRect on the Hull.
+                warped_wheel, box_points = get_warped_rect(image, hull)
+                results["wheel"] = warped_wheel
+                cv2.drawContours(output_img, [np.intp(box_points)], 0, (0, 255, 255), 3)
 
     # ============================================
-    # STAGE 3: ENCLOSURES (Hollow Objects)
+    # STAGE 3: ENCLOSURES (Reuse Edges)
     # ============================================
-    gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
-    v = np.median(blur)
-    lower_canny = int(max(0, (1.0 - 0.33) * v))
-    upper_canny = int(min(255, (1.0 + 0.33) * v))
-    edges = cv2.Canny(blur, lower_canny, upper_canny)
-    edges_dilated = cv2.dilate(edges, kernel_small, iterations=1)
-    visuals.append(add_label(edges_dilated, "4. Edges"))
-
+    # We reuse the dilated edges from the start
     contours, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     potential_enclosures = []
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
+        # Avoid re-detecting the papers we already found
+        # (A simple check: is the center of this contour inside our paper mask?)
+        M = cv2.moments(cnt)
+        if M["m00"] > 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            if paper_occupancy_mask[cY, cX] > 0:
+                continue
+
         if area > 15000: 
             peri = cv2.arcLength(cnt, True)
             circularity = (4 * np.pi * area) / (peri ** 2) if peri > 0 else 0
@@ -306,7 +334,7 @@ def detect_game_elements_visualized(image):
 
 def main():
     # Update this path to your local image
-    image_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/img_2(main_elements).png'
+    image_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/img_3(main_elements).png'
     img = cv2.imread(image_path)
     if img is None:
         print(f"Error loading image from {image_path}")
