@@ -17,7 +17,7 @@ class GameConfig:
         "Red_2":   ((170, 20, 70), (180, 255, 255)),  # Upper Red (wraps around)
         "Yellow":  ((20, 20, 70), (35, 255, 255)),    # Yellow
         "Purple":  ((120, 20, 50), (145, 255, 255)),  # Purple (Replaces Green)
-        "Blue":    ((95, 20, 70), (115, 255, 255)),   # Blue
+        "Blue":    ((85, 20, 70), (115, 255, 255)),   # Blue
     }
 
     # --- Stabilizer Settings ---
@@ -299,14 +299,32 @@ class BoardDetector:
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
         
-        # --- STAGE 1: PAPERS (Strictly 2 Players) ---
-        v = np.median(blur)
-        lower = int(max(0, 0.67 * v)); upper = int(min(255, 1.33 * v))
-        edges = cv2.Canny(blur, lower, upper)
-        edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=2)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # --- STAGE 1: PAPERS (Top-Down Neighbors) ---
+        # HYBRID APPROACH: Color Thresholding + Canny Edge Detection
         
-        # Find all valid paper candidates
+        # === METHOD 1: White Color Masking (Good for occlusion/hands) ===
+        # Adjust lower_white V value (160) if papers are not detected
+        lower_white = np.array([0, 0, 160]) 
+        upper_white = np.array([180, 60, 255])
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+        
+        kernel = np.ones((5,5), np.uint8)
+        mask_white = cv2.morphologyEx(mask_white, cv2.MORPH_OPEN, kernel)
+        mask_white = cv2.dilate(mask_white, kernel, iterations=1)
+        cnts_white, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # === METHOD 2: Canny Edge Detection (Good for contrast boundaries) ===
+        v = np.median(blur)
+        lower_canny = int(max(0, 0.67 * v))
+        upper_canny = int(min(255, 1.33 * v))
+        edges = cv2.Canny(blur, lower_canny, upper_canny)
+        edges = cv2.dilate(edges, kernel, iterations=2)
+        cnts_canny, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # === MERGE & PROCESS ===
+        cnts = list(cnts_white) + list(cnts_canny)
+        
+        # Collect valid candidates with metadata
         paper_candidates = []
         for cnt in cnts:
             if cv2.contourArea(cnt) > GameConfig.MIN_CONTOUR_AREA:
@@ -315,38 +333,85 @@ class BoardDetector:
                 approx = cv2.approxPolyDP(hull, 0.04 * peri, True)
                 
                 if len(approx) == 4:
-                    # FIX: Use approxPolyDP points directly (handles perspective)
                     pts = approx.reshape(4, 2).astype(np.float32)
                     
+                    # Aspect Ratio Check
                     d1 = np.linalg.norm(pts[0]-pts[1]); d2 = np.linalg.norm(pts[1]-pts[2])
                     ar = max(d1, d2) / min(d1, d2) if min(d1, d2) > 0 else 0
                     
-                    if 1.3 < ar < 1.6:
-                        x, y, _, _ = cv2.boundingRect(hull)
-                        # Store 'pts' instead of 'hull'
-                        paper_candidates.append((x, pts))
+                    # Solidity Check (Rectangle fullness)
+                    min_rect = cv2.minAreaRect(hull)
+                    min_rect_area = min_rect[1][0] * min_rect[1][1]
+                    hull_area = cv2.contourArea(hull)
+                    solidity = (hull_area / min_rect_area) if min_rect_area > 0 else 0
+
+                    if 1.2 < ar < 1.7 and solidity > 0.90:
+                        x, y, w, h = cv2.boundingRect(hull)
+                        paper_candidates.append({
+                            'pts': pts,
+                            'area': hull_area,
+                            'center': (x + w//2, y + h//2)
+                        })
+
+        # --- SMART FILTERING (Non-Maximum Suppression) ---
         
-        # Sort Left-to-Right and take top 2
-        paper_candidates.sort(key=lambda x: x[0])
-        paper_candidates = paper_candidates[:2]
+        # 1. Sort by Area Descending (Largest = Best).
+        paper_candidates.sort(key=lambda x: x['area'], reverse=True)
         
-        # Process P1 and P2
+        unique_papers = []
+        min_dist_sq = (frame.shape[0] * 0.1) ** 2  # Threshold: ~10% of screen height squared
+        
+        for cand in paper_candidates:
+            if len(unique_papers) >= 2: break 
+            
+            is_duplicate = False
+            c1 = np.array(cand['center'])
+            for existing in unique_papers:
+                c2 = np.array(existing['center'])
+                if np.sum((c1 - c2) ** 2) < min_dist_sq:
+                    is_duplicate = True
+                    break 
+            
+            if not is_duplicate:
+                unique_papers.append(cand)
+
+        # 2. Assign Top/Bottom Slots (Vertical Split)
+        # CHANGED: Use Y-coordinate (height) to split instead of X
+        screen_center_y = frame.shape[0] // 2
+        final_slots = [None, None] # [Top_Paper, Bottom_Paper]
+
+        for paper in unique_papers:
+            # If center Y is higher (smaller value) than middle -> Top (Slot 0)
+            # Else -> Bottom (Slot 1)
+            idx = 0 if paper['center'][1] < screen_center_y else 1
+            
+            if final_slots[idx] is None:
+                final_slots[idx] = paper['pts']
+
+        # 3. Process Stabilizers
         detected_papers = [] 
-        for i, (_, raw_corners) in enumerate(paper_candidates):
-            # We now have the exact corners of the quad, not a bounding rect.
+        for i in range(2): # 0 = Top, 1 = Bottom
+            raw_corners = final_slots[i]
+            stabilizer = self.paper_stabilizers[i]
             
-            # Update specific stabilizer (0 or 1)
-            stable_corners = self.paper_stabilizers[i].update(raw_corners)
+            stable_corners = None
+            if raw_corners is not None:
+                stable_corners = stabilizer.update(raw_corners)
+            elif stabilizer.locked_coords is not None:
+                stable_corners = stabilizer.locked_coords
             
-            warped, box = warp_from_points(frame, stable_corners)
-            detected_papers.append(warped)
-            
-            cv2.drawContours(output_img, [box], 0, self.colors["paper"], 2)
-            cv2.drawContours(occupied_mask, [box], -1, 255, -1)
-            
-            # Label strictly as P1 or P2
-            cv2.putText(output_img, f"P{i+1}", (box[0][0], box[0][1]-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors["paper"], 2)
+            if stable_corners is not None:
+                warped, box = warp_from_points(frame, stable_corners)
+                detected_papers.append(warped)
+                
+                cv2.drawContours(output_img, [box], 0, self.colors["paper"], 2)
+                cv2.drawContours(occupied_mask, [box], -1, 255, -1)
+                
+                label = "P1 (Top)" if i == 0 else "P2 (Bot)"
+                cv2.putText(output_img, label, (box[0][0], box[0][1]-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors["paper"], 2)
+            else:
+                detected_papers.append(None)
 
         crops["papers"] = detected_papers
 
@@ -557,7 +622,7 @@ def process_video(input_path, output_path):
     print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_6.MOV'
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_1.MOV'
     output_path = 'game_output.MOV'
     if os.path.exists(video_path): process_video(video_path, output_path)
     else: print(f"File not found: {video_path}")
