@@ -21,7 +21,7 @@ class GameConfig:
     }
 
     # --- Stabilizer Settings ---
-    STABILIZER_HISTORY_LEN = 30       # Frames to keep in buffer for smoothing
+    STABILIZER_HISTORY_LEN = 60       # Frames to keep in buffer for smoothing
     STABILIZER_THRESHOLD = 4.0        # Max pixel deviation allowed to "lock" the view
 
     # --- Wheel Analysis Settings ---
@@ -515,11 +515,12 @@ class BoardDetector:
             cv2.drawContours(occupied_mask, [box], -1, 255, -1)
             
         occupied_mask = cv2.dilate(occupied_mask, np.ones((15,15), np.uint8), iterations=2)
-        cv2.imshow("Occupied Mask Debug", cv2.resize(occupied_mask, (0,0), fx=0.5, fy=0.5))
+        #cv2.imshow("Occupied Mask Debug", cv2.resize(occupied_mask, (0,0), fx=0.5, fy=0.5))
+        
         # --- STAGE 3: CIRCLE ---
         gray_med = cv2.medianBlur(gray, 7)
         circles = cv2.HoughCircles(gray_med, cv2.HOUGH_GRADIENT, dp=1.5, minDist=100,
-                                   param1=50, param2=30, minRadius=40, maxRadius=150)
+                                   param1=50, param2=30, minRadius=120, maxRadius=250)
         raw_circle_box = None
         if circles is not None:
             circles = np.uint16(np.around(circles))
@@ -542,13 +543,15 @@ class BoardDetector:
             crops["circle"] = frame[y:y+h, x:x+w]
             cx, cy, r = x + w//2, y + h//2, max(w, h)//2
             cv2.circle(output_img, (cx, cy), r, self.colors["circle"], 3)
-            cv2.circle(occupied_mask, (cx, cy), int(r+5), 255, -1)
+            cv2.circle(occupied_mask, (cx, cy), int(r+20), 255, -1)
 
         # --- STAGE 4: SQUARE ---
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 3)
         thresh = cv2.bitwise_and(thresh, thresh, mask=cv2.bitwise_not(occupied_mask))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
-        clusters = cv2.dilate(thresh, np.ones((9,9),np.uint8), iterations=3)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))  
+        clusters = cv2.dilate(thresh, np.ones((9,9),np.uint8), iterations=3)     
+        clusters = cv2.erode(clusters, np.ones((9,9),np.uint8), iterations=3)
+        cv2.imshow("Occupied Mask Debug", cv2.resize(clusters, (0,0), fx=0.5, fy=0.5)) 
         cnts, _ = cv2.findContours(clusters, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
         raw_sq_corners = None
