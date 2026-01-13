@@ -16,7 +16,7 @@ class GameConfig:
         "Red_1":   ((0, 20, 70), (10, 255, 255)),     # Lower Red
         "Red_2":   ((170, 20, 70), (180, 255, 255)),  # Upper Red (wraps around)
         "Yellow":  ((20, 20, 70), (35, 255, 255)),    # Yellow
-        "Purple":  ((120, 20, 50), (145, 255, 255)),  # Purple (Replaces Green)
+        "Purple":  ((120, 10, 50), (145, 255, 255)),  # Purple (Replaces Green)
         "Blue":    ((85, 20, 70), (115, 255, 255)),   # Blue
     }
 
@@ -473,20 +473,29 @@ class BoardDetector:
             
             # Check for 4 corners
             if len(approx) == 4:
-                corners = approx.reshape(4, 2).astype(np.float32)
+                hull_area = cv2.contourArea(master_hull)
+            
+                # 2. Find the smallest possible rotated rectangle that fits the hull
+                # This is more robust than approxPolyDP for noisy shapes
+                rect = cv2.minAreaRect(master_hull)
+                (cx, cy), (w, h), angle = rect
+                rect_area = w * h
                 
-                # Extra Robustness: Check Aspect Ratio
-                # A valid board is roughly square (AR ~ 1.0)
-                # We calculate distances between corners to verify.
-                (tl, tr, br, bl) = order_points(corners)
-                width = np.linalg.norm(tr - tl)
-                height = np.linalg.norm(bl - tl)
-                
-                if width > 0 and height > 0:
-                    ar = width / height
-                    # Loose check: 0.7 to 1.4 allows for perspective distortion
-                    if 0.7 < ar < 1.3: 
-                        raw_corners = corners
+                if rect_area > 0:
+                    # 3. Solidity Check (Intersection over Union-like ratio)
+                    # How much of the rectangle is actually filled by the hull?
+                    solidity = hull_area / rect_area
+                    
+                    # 4. Squareness Check (Aspect Ratio of the rotated box)
+                    aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+                    
+                    # Validation: High solidity (>0.85) and nearly equal sides (<1.3)
+                    if solidity > 0.85 and aspect_ratio < 1.3:
+                        raw_corners = approx.reshape(4, 2).astype(np.float32)
+                    else:
+                        # Convert rotated rect to 4 corner points
+                        box = cv2.boxPoints(rect)
+                        raw_corners = np.array(box, dtype=np.float32)
             else:
                 # Fallback: If approxPolyDP fails (e.g. 5 points due to a clipped corner),
                 # force a rectangle fit, but only if the shape is substantial.
@@ -625,7 +634,7 @@ def process_video(input_path, output_path):
     print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_1.MOV'
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_4.MOV'
     output_path = 'game_output.MOV'
     if os.path.exists(video_path): process_video(video_path, output_path)
     else: print(f"File not found: {video_path}")
