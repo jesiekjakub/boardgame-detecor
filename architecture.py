@@ -350,39 +350,107 @@ class BoardDetector:
 
         crops["papers"] = detected_papers
 
-        # --- STAGE 2: WHEEL ---
-        mask_wheel = cv2.inRange(hsv, (20, 70, 80), (35, 255, 255)) | cv2.inRange(hsv, (95, 20, 80), (125, 255, 255)) # Yellow, Purple, Blue from config
+        # --- STAGE 2: WHEEL (Contour Solidity Strategy) ---
+        
+        # 1. Color Masking (Same as before)
+        mask_wheel = np.zeros(frame.shape[:2], dtype=np.uint8)
+        target_colors = ["Yellow", "Purple", "Blue"]
+        
+        for color_name in target_colors:
+            if color_name in GameConfig.COLOR_RANGES:
+                lower, upper = GameConfig.COLOR_RANGES[color_name]
+                mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+                mask_wheel = cv2.bitwise_or(mask_wheel, mask)
+        
+        # 2. Subtract Papers & Clean
         mask_wheel = cv2.bitwise_and(mask_wheel, mask_wheel, mask=cv2.bitwise_not(occupied_mask))
-        mask_wheel = cv2.morphologyEx(mask_wheel, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
-        pts = cv2.findNonZero(mask_wheel)
+        mask_wheel = cv2.morphologyEx(mask_wheel, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+        #cv2.imshow("Wheel Mask Debug", cv2.resize(mask_wheel, (0,0), fx=0.5, fy=0.5))
+
+        # 3. Solidity Filtering
+        # Find all individual blobs (triangles, noise, arm parts)
+        cnts_wheel, _ = cv2.findContours(mask_wheel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_points = []
+        
+        for cnt in cnts_wheel:
+            area = cv2.contourArea(cnt)
+            if area < 500: continue # Ignore tiny noise
+            
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            
+            if hull_area > 0:
+                solidity = float(area) / hull_area
+                
+                # CRITICAL FILTER: 
+                # The wheel's colored triangles are solid geometric shapes (Solidity ~ 1.0).
+                # An arm/hand is irregular and has lower solidity.
+                if solidity > 0.85: 
+                    # This contour is likely a valid part of the wheel. Add its points.
+                    # We add the points from the convex hull to be safe/clean.
+                    valid_points.extend(hull.reshape(-1, 2))
+
+        # 4. Global Geometry Check
         raw_corners = None
-        if pts is not None:
-            pts = pts.squeeze()
-            if pts.ndim == 1: pts = pts.reshape(-1, 2)
-            center = np.median(pts, axis=0)
-            dists = np.linalg.norm(pts - center, axis=1)
-            q1, q3 = np.percentile(dists, [25, 75])
-            pts = pts[dists < (q3 + 1.5*(q3-q1))]
-            if len(pts) > 4:
-                hull = cv2.convexHull(pts.astype(np.int32))
-                peri = cv2.arcLength(hull, True)
-                approx = cv2.approxPolyDP(hull, 0.04*peri, True)
-                if len(approx) == 4: raw_corners = approx.reshape(4, 2)
-                else: rect = cv2.minAreaRect(hull); raw_corners = cv2.boxPoints(rect)
         
-        # Stabilize Wheel
-        if raw_corners is not None: stable_corners = self.wheel_stabilizer.update(raw_corners)
-        elif self.wheel_stabilizer.locked_coords is not None: stable_corners = self.wheel_stabilizer.locked_coords
-        else: stable_corners = None
-        
+        if len(valid_points) > 0:
+            # Create a single array of all valid points
+            all_pts = np.array(valid_points, dtype=np.int32)
+            
+            # Find the Convex Hull of the ENTIRE set of valid pieces
+            # This wraps all the triangles into one big shape (the Square of Fortune)
+            master_hull = cv2.convexHull(all_pts)
+            
+            # Check if this master hull forms a Square
+            peri = cv2.arcLength(master_hull, True)
+            approx = cv2.approxPolyDP(master_hull, 0.04 * peri, True)
+            
+            # Check for 4 corners
+            if len(approx) == 4:
+                corners = approx.reshape(4, 2).astype(np.float32)
+                
+                # Extra Robustness: Check Aspect Ratio
+                # A valid board is roughly square (AR ~ 1.0)
+                # We calculate distances between corners to verify.
+                (tl, tr, br, bl) = order_points(corners)
+                width = np.linalg.norm(tr - tl)
+                height = np.linalg.norm(bl - tl)
+                
+                if width > 0 and height > 0:
+                    ar = width / height
+                    # Loose check: 0.7 to 1.4 allows for perspective distortion
+                    if 0.7 < ar < 1.3: 
+                        raw_corners = corners
+            else:
+                # Fallback: If approxPolyDP fails (e.g. 5 points due to a clipped corner),
+                # force a rectangle fit, but only if the shape is substantial.
+                rect = cv2.minAreaRect(master_hull)
+                w, h = rect[1]
+                if w > 0 and h > 0:
+                    ar = min(w,h) / max(w,h)
+                    if 0.7 < ar < 1.3: # Still must be somewhat square
+                        raw_corners = cv2.boxPoints(rect)
+
+        # 5. Stabilization
+        stable_corners = None
+        if raw_corners is not None:
+            stable_corners = self.wheel_stabilizer.update(raw_corners)
+        elif self.wheel_stabilizer.locked_coords is not None:
+            stable_corners = self.wheel_stabilizer.locked_coords
+            
+        # 6. Extract & Update Mask
         if stable_corners is not None:
             warped, box = warp_from_points(frame, stable_corners)
             crops["wheel"] = warped
-            cv2.drawContours(output_img, [box], 0, self.colors["wheel"], 3)
+            
+            is_locked = (self.wheel_stabilizer.locked_coords is not None)
+            color = self.colors["wheel"] if is_locked else (0, 255, 255) 
+            cv2.drawContours(output_img, [box], 0, color, 3 if is_locked else 1)
             cv2.drawContours(occupied_mask, [box], -1, 255, -1)
-        
-        occupied_mask = cv2.dilate(occupied_mask, np.ones((15,15),np.uint8), iterations=2)
-
+            
+        occupied_mask = cv2.dilate(occupied_mask, np.ones((15,15), np.uint8), iterations=2)
+        cv2.imshow("Occupied Mask Debug", cv2.resize(occupied_mask, (0,0), fx=0.5, fy=0.5))
         # --- STAGE 3: CIRCLE ---
         gray_med = cv2.medianBlur(gray, 7)
         circles = cv2.HoughCircles(gray_med, cv2.HOUGH_GRADIENT, dp=1.5, minDist=100,
@@ -489,7 +557,7 @@ def process_video(input_path, output_path):
     print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_2.MOV'
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_6.MOV'
     output_path = 'game_output.MOV'
     if os.path.exists(video_path): process_video(video_path, output_path)
     else: print(f"File not found: {video_path}")
