@@ -490,7 +490,7 @@ class BoardDetector:
                     aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
                     
                     # Validation: High solidity (>0.85) and nearly equal sides (<1.3)
-                    if solidity > 0.85 and aspect_ratio < 1.3:
+                    if solidity > 0.80 and aspect_ratio < 1.3:
                         raw_corners = approx.reshape(4, 2).astype(np.float32)
                     else:
                         # Convert rotated rect to 4 corner points
