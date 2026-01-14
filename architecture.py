@@ -9,30 +9,40 @@ import os
 class GameConfig:
     """
     Central configuration for all game detection parameters.
-    Adjust these values based on your lighting and camera setup.
     """
     # --- Color Calibration (HSV: H=0-179, S=0-255, V=0-255) ---
     COLOR_RANGES = {
-        "Red_1":   ((0, 20, 70), (10, 255, 255)),     # Lower Red
-        "Red_2":   ((170, 20, 70), (180, 255, 255)),  # Upper Red (wraps around)
-        "Yellow":  ((20, 20, 70), (35, 255, 255)),    # Yellow
-        "Purple":  ((120, 10, 50), (145, 255, 255)),  # Purple (Replaces Green)
-        "Blue":    ((85, 20, 70), (115, 255, 255)),   # Blue
+        "Red_1":   ((0, 20, 70), (10, 255, 255)),     
+        "Red_2":   ((170, 20, 70), (180, 255, 255)),  
+        "Yellow":  ((20, 20, 70), (35, 255, 255)),    
+        "Purple":  ((120, 10, 50), (145, 255, 255)),  
+        "Blue":    ((85, 20, 70), (115, 255, 255)),   
     }
 
+    # --- Token Colors & Points (New) ---
+    # Specific ranges for the small cards on papers
+    TOKEN_COLORS = {
+        "Blue":   {"range": ((37, 1, 70), (60, 255, 255)), "points": 1},
+        "Green":  {"range": ((27, 20, 50), (37, 255, 255)),  "points": 5},
+        "Purple": {"range": ((154, 10, 40), (174, 255, 255)), "points": 10},
+        "Orange": {"range": ((10, 90, 100), (27, 255, 255)), "points": 50} 
+    }
+    
+    MIN_TOKEN_AREA_PCT = 0.02 # 2% of total paper area
+
     # --- Stabilizer Settings ---
-    STABILIZER_HISTORY_LEN = 60       # Frames to keep in buffer for smoothing
-    STABILIZER_THRESHOLD = 4.0        # Max pixel deviation allowed to "lock" the view
+    STABILIZER_HISTORY_LEN = 60       
+    STABILIZER_THRESHOLD = 4.0        
 
     # --- Wheel Analysis Settings ---
-    WHEEL_HISTORY_LEN = 15            # Frames to track for state logic (Spinning vs Stopped)
-    NEEDLE_VALUE_THRESH = 110         # Max Value (brightness) to consider "Black"
-    ROI_RADIUS = 20                   # Radius of the voting circle around the needle tip
-    MIN_VOTES = 5                     # Min valid pixels required to declare a color found
+    WHEEL_HISTORY_LEN = 15            
+    NEEDLE_VALUE_THRESH = 110         
+    ROI_RADIUS = 20                   
+    MIN_VOTES = 5                     
 
     # --- General Detection ---
-    MIN_CONTOUR_AREA = 5000           # Min area for Papers/Containers
-    MIN_NEEDLE_AREA = 50              # Min area for the Needle
+    MIN_CONTOUR_AREA = 5000           
+    MIN_NEEDLE_AREA = 50              
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -57,19 +67,6 @@ def warp_from_points(image, pts):
     warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(sorted_pts, dst), (width, height))
     return warped, sorted_pts.astype(int)
 
-def get_warped_rect(image, contour):
-    """Fallback warp using minAreaRect if 4 corners aren't found cleanly."""
-    rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect); box = np.intp(box)
-    pts = order_points(box)
-    (tl, tr, br, bl) = pts
-    width = max(int(np.linalg.norm(br-bl)), int(np.linalg.norm(tr-tl)))
-    height = max(int(np.linalg.norm(tr-br)), int(np.linalg.norm(tl-bl)))
-    dst = np.array([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]], dtype="float32")
-    warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(pts, dst), (width, height))
-    if warped.shape[1] * 0.9 > warped.shape[0]: warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
-    return warped, box
-
 # ==========================================
 # 3. STABILIZER
 # ==========================================
@@ -83,19 +80,15 @@ class CornerStabilizer:
 
     def update(self, new_coords):
         sorted_coords = order_points(new_coords)
-        
-        # Instant fill on first detection to avoid lag
         if not self.history:
             for _ in range(self.history_len): self.history.append(sorted_coords)
         else:
             self.history.append(sorted_coords)
         
-        # Calculate stability (max deviation from mean)
         history_arr = np.array(self.history)
         mean_coords = np.mean(history_arr, axis=0)
         max_deviation = np.max(np.linalg.norm(history_arr - mean_coords, axis=2))
         
-        # If stable, update the lock. If unstable, keep the old lock.
         if max_deviation < self.threshold:
             self.locked_coords = mean_coords.astype(np.float32)
             
@@ -114,96 +107,58 @@ class WheelAnalyzer:
     def find_outermost_tip(self, hsv_crop):
         h, w = hsv_crop.shape[:2]
         center = np.array([w // 2, h // 2])
-        
-        # 1. Mask Black (Needle) using Config Threshold
         lower_black = np.array([0, 0, 0])
         upper_black = np.array([180, 255, GameConfig.NEEDLE_VALUE_THRESH]) 
         mask = cv2.inRange(hsv_crop, lower_black, upper_black)
-        
-        # Use Close to preserve thin tips
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=2)
         
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts: return None, None
         
-        # 2. Filter contours: Must be somewhat central and large enough
         valid_cnts = []
         for cnt in cnts:
             if cv2.contourArea(cnt) < GameConfig.MIN_NEEDLE_AREA: continue
             M = cv2.moments(cnt)
             if M["m00"] > 0:
                 cX = int(M["m10"] / M["m00"]); cY = int(M["m01"] / M["m00"])
-                # Must be within 30% of image center
                 if np.linalg.norm(np.array([cX, cY]) - center) < w * 0.3:
                     valid_cnts.append(cnt)
         
         needle_cnt = max(valid_cnts, key=cv2.contourArea) if valid_cnts else max(cnts, key=cv2.contourArea)
         if cv2.contourArea(needle_cnt) < GameConfig.MIN_NEEDLE_AREA: return None, None
 
-        # 3. Find point furthest from center
         points = needle_cnt.reshape(-1, 2)
         dists = np.linalg.norm(points - center, axis=1)
         outermost_tip = points[np.argmax(dists)]
-        
         return outermost_tip, needle_cnt
 
     def get_color_by_voting(self, hsv_crop, tip, debug_img=None):
         h, w = hsv_crop.shape[:2]
         radius = GameConfig.ROI_RADIUS
-        
-        # ROI Mask
         mask_roi = np.zeros((h, w), dtype=np.uint8)
         cv2.circle(mask_roi, tuple(tip), radius, 255, -1)
         
-        # Exclusion Masks (Black Needle & Grey Background)
         mask_black = cv2.inRange(hsv_crop, np.array([0,0,0]), np.array([180, 255, GameConfig.NEEDLE_VALUE_THRESH]))
         mask_grey = cv2.inRange(hsv_crop, np.array([0,0,0]), np.array([180, 50, 255]))
         mask_invalid = cv2.bitwise_or(mask_black, mask_grey)
-        
-        # Final Valid Mask
         mask_valid = cv2.bitwise_and(mask_roi, cv2.bitwise_not(mask_invalid))
         
-        # --- DEBUG VISUALIZATION ---
-        if debug_img is not None:
-            # Draw ROI and Valid Pixels
-            cv2.circle(debug_img, tuple(tip), radius, (255, 255, 255), 1)
-            
-            # Compute stats of valid pixels
-            valid_pixels = hsv_crop[mask_valid > 0]
-            if valid_pixels.size > 0:
-                mean_hsv = np.mean(valid_pixels, axis=0)
-                stat_txt = f"H:{int(mean_hsv[0])} S:{int(mean_hsv[1])} V:{int(mean_hsv[2])}"
-                # Background box for text
-                cv2.rectangle(debug_img, (0, h-25), (160, h), (0,0,0), -1)
-                cv2.putText(debug_img, stat_txt, (5, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
-
-        # Voting
         votes = {k: 0 for k in GameConfig.COLOR_RANGES.keys() if k != "Red_2"}
-        # Map "Red_2" votes to "Red_1" (simply "Red") logic
-        
         for color_name, (lower, upper) in GameConfig.COLOR_RANGES.items():
             mask_color = cv2.inRange(hsv_crop, np.array(lower), np.array(upper))
             mask_final = cv2.bitwise_and(mask_valid, mask_color)
             count = cv2.countNonZero(mask_final)
-            
-            # Aggregate Red
             key = "Red_1" if "Red" in color_name else color_name
-            if key in votes:
-                votes[key] += count
+            if key in votes: votes[key] += count
 
         total_votes = sum(votes.values())
         if total_votes < GameConfig.MIN_VOTES: return "Unknown"
-        
-        # Normalize name (Red_1 -> Red)
         winner = max(votes, key=votes.get)
         return "Red" if "Red" in winner else winner
 
     def analyze(self, wheel_crop, debug_vis_img=None):
         if wheel_crop is None or wheel_crop.size == 0: return "No Wheel", "N/A"
-
         hsv = cv2.cvtColor(wheel_crop, cv2.COLOR_BGR2HSV)
-        
-        # 1. Find Tip
         tip, needle_cnt = self.find_outermost_tip(hsv)
         current_color = "Unknown"
         
@@ -211,28 +166,13 @@ class WheelAnalyzer:
             if debug_vis_img is not None:
                 cv2.drawContours(debug_vis_img, [needle_cnt], -1, (255, 0, 255), 2)
                 cv2.circle(debug_vis_img, tuple(tip), 3, (0, 0, 255), -1)
-            
-            # 2. Vote for Color
             current_color = self.get_color_by_voting(hsv, tip, debug_vis_img)
-            
-            if debug_vis_img is not None:
-                cv2.putText(debug_vis_img, f"Res: {current_color}", (5, 20), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
-        # 3. Update State History
         self.color_history.append(current_color)
-
-        if len(self.color_history) < self.history_len:
-            return "Initializing...", "N/A"
-
-        # Filter valid readings
+        if len(self.color_history) < self.history_len: return "Initializing...", "N/A"
         valid = [c for c in self.color_history if c not in ["Unknown"]]
-        
         if len(valid) < 5: return "Searching...", "N/A"
-            
         unique = set(valid)
-        
-        # Logic: Changing colors = Spinning. Constant color = Stopped.
         if len(unique) > 1:
             self.current_state = "SPINNING"
             return "SPINNING", "..."
@@ -245,17 +185,144 @@ class WheelAnalyzer:
                 return "IDLE", stable_col
 
 # ==========================================
-# 5. GAME STATE MANAGER
+# 5. PAPER ANALYZER (NEW)
+# ==========================================
+
+# ==========================================
+# 5. PAPER ANALYZER (CORRECTED)
+# ==========================================
+
+# ==========================================
+# 5. PAPER ANALYZER (With Visualization)
+# ==========================================
+
+# ==========================================
+# 5. PAPER ANALYZER (Multi-Channel Logic)
+# ==========================================
+
+class PaperAnalyzer:
+    def __init__(self):
+        self.token_config = GameConfig.TOKEN_COLORS
+        self.min_area_pct = GameConfig.MIN_TOKEN_AREA_PCT
+        self.max_area_pct = 0.20 
+        
+        # New Settings for 2:1 Ratio Logic
+        self.target_ratio = 2.2
+        self.ratio_tolerance = 0.3 # Accepts ratios from ~1.4 to ~2.6
+        self.min_solidity = 0.85
+
+    def analyze(self, paper_crop, debug_img=None):
+        if paper_crop is None:
+            return 0, None
+
+        total_score = 0
+        h, w = paper_crop.shape[:2]
+        paper_area = h * w
+        viz_crop = paper_crop.copy()
+        
+        hsv = cv2.cvtColor(paper_crop, cv2.COLOR_BGR2HSV)
+        
+        for color_name, info in self.token_config.items():
+            lower, upper = info["range"]
+            points = info["points"]
+            
+            # 1. Pre-processing
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.erode(mask, kernel, iterations=1) 
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                area_pct = area / paper_area
+                
+                if self.min_area_pct <= area_pct <= self.max_area_pct:
+                    
+                    # --- GEOMETRIC CHECKS ---
+                    rect = cv2.minAreaRect(cnt)
+                    (cx, cy), (rw, rh), angle = rect
+                    box = np.intp(cv2.boxPoints(rect))
+                    
+                    # Calculate Solidity
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    solidity = float(area) / hull_area if hull_area > 0 else 0
+                    
+                    # Calculate Aspect Ratio (Long side / Short side)
+                    short_side = min(rw, rh)
+                    long_side = max(rw, rh)
+                    ar = long_side / short_side if short_side > 0 else 0
+                    
+                    # Check if ratio is "More or less 2:1"
+                    valid_ratio = (self.target_ratio - self.ratio_tolerance) < ar < (self.target_ratio + self.ratio_tolerance)
+                    valid_solidity = solidity > self.min_solidity
+
+                    # --- DECISION TREE ---
+                    
+                    # PATH A: Perfect Single Rectangle
+                    if valid_solidity and valid_ratio:
+                        total_score += points
+                        
+                        # Draw Green Box
+                        cv2.drawContours(viz_crop, [box], 0, (0, 255, 0), 2)
+                        cv2.putText(viz_crop, f"{points}pts", (box[1][0], box[1][1] - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                    # PATH B: Fallback (Glued, Wrong Ratio, or Irregular Shape)
+                    elif solidity > self.min_solidity*0.9:
+                        # Prepare mask for Watershed
+                        mask_roi = np.zeros_like(mask)
+                        cv2.drawContours(mask_roi, [cnt], -1, 255, -1)
+                        
+                        # Distance Transform to find peaks
+                        dist = cv2.distanceTransform(mask_roi, cv2.DIST_L2, 5)
+                        _, peak_mask = cv2.threshold(dist, 0.5 * dist.max(), 255, 0)
+                        peak_mask = peak_mask.astype(np.uint8)
+                        
+                        # Count peaks
+                        peak_cnts, _ = cv2.findContours(peak_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        num_peaks = len(peak_cnts)
+                        if num_peaks < 1: num_peaks = 1 # Safety net
+                        
+                        score_add = points * num_peaks
+                        total_score += score_add
+                        
+                        # Draw Orange Box (Indicating Fallback/Split used)
+                        cv2.drawContours(viz_crop, [box], 0, (0, 165, 255), 2)
+                        cv2.putText(viz_crop, f"x{num_peaks} ({score_add}pts)", 
+                                    (box[1][0], box[1][1] - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        return total_score, viz_crop
+
+# ==========================================
+# 6. GAME STATE MANAGER
 # ==========================================
 
 class GameStateManager:
     def __init__(self):
         self.scores = {"Paper_1": 0, "Paper_2": 0}
         self.wheel_analyzer = WheelAnalyzer()
+        self.paper_analyzer = PaperAnalyzer() # Initialized new analyzer
 
     def handle_paper(self, crop, paper_index):
         # 0 -> Paper 1, 1 -> Paper 2
-        return f"Paper {paper_index + 1}: 0"
+        
+        if crop is None: 
+            return f"Paper {paper_index + 1}: Not Found"
+            
+        # Analyze the cropped paper for small rectangles
+        score, viz_crop = self.paper_analyzer.analyze(crop)
+        
+        # Update internal score (optional logic for accumulation can be added here)
+        self.scores[f"Paper_{paper_index+1}"] = score
+        
+        # Show the debug view of the paper to see detected rectangles
+        cv2.imshow(f"Paper {paper_index + 1} Analysis", viz_crop)
+        
+        return f"Paper {paper_index + 1}: {score}"
 
     def handle_wheel(self, crop):
         debug_vis = crop.copy()
@@ -273,7 +340,7 @@ class GameStateManager:
         return f"{type_name}: 0"
 
 # ==========================================
-# 6. BOARD DETECTOR (2-Player Logic)
+# 7. BOARD DETECTOR (2-Player Logic)
 # ==========================================
 
 class BoardDetector:
@@ -285,13 +352,10 @@ class BoardDetector:
         self.wheel_stabilizer = CornerStabilizer()
         self.circle_stabilizer = CornerStabilizer()
         self.square_stabilizer = CornerStabilizer()
-        
-        # Fixed stabilizers for exactly 2 papers
         self.paper_stabilizers = {0: CornerStabilizer(), 1: CornerStabilizer()}
 
     def detect_elements(self, frame):
         output_img = frame.copy()
-        # Initialize dictionary with fixed keys for 2 players
         crops = {"papers": [None, None], "wheel": None, "hollow_square": None, "circle": None}
         
         occupied_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -299,11 +363,7 @@ class BoardDetector:
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
         
-        # --- STAGE 1: PAPERS (Top-Down Neighbors) ---
-        # HYBRID APPROACH: Color Thresholding + Canny Edge Detection
-        
-        # === METHOD 1: White Color Masking (Good for occlusion/hands) ===
-        # Adjust lower_white V value (160) if papers are not detected
+        # --- STAGE 1: PAPERS ---
         lower_white = np.array([0, 0, 160]) 
         upper_white = np.array([180, 60, 255])
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
@@ -313,7 +373,6 @@ class BoardDetector:
         mask_white = cv2.dilate(mask_white, kernel, iterations=1)
         cnts_white, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # === METHOD 2: Canny Edge Detection (Good for contrast boundaries) ===
         v = np.median(blur)
         lower_canny = int(max(0, 0.67 * v))
         upper_canny = int(min(255, 1.33 * v))
@@ -321,10 +380,8 @@ class BoardDetector:
         edges = cv2.dilate(edges, kernel, iterations=2)
         cnts_canny, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # === MERGE & PROCESS ===
         cnts = list(cnts_white) + list(cnts_canny)
         
-        # Collect valid candidates with metadata
         paper_candidates = []
         for cnt in cnts:
             if cv2.contourArea(cnt) > GameConfig.MIN_CONTOUR_AREA:
@@ -334,12 +391,9 @@ class BoardDetector:
                 
                 if len(approx) == 4:
                     pts = approx.reshape(4, 2).astype(np.float32)
-                    
-                    # Aspect Ratio Check
                     d1 = np.linalg.norm(pts[0]-pts[1]); d2 = np.linalg.norm(pts[1]-pts[2])
                     ar = max(d1, d2) / min(d1, d2) if min(d1, d2) > 0 else 0
                     
-                    # Solidity Check (Rectangle fullness)
                     min_rect = cv2.minAreaRect(hull)
                     min_rect_area = min_rect[1][0] * min_rect[1][1]
                     hull_area = cv2.contourArea(hull)
@@ -353,71 +407,49 @@ class BoardDetector:
                             'center': (x + w//2, y + h//2)
                         })
 
-        # --- SMART FILTERING (Non-Maximum Suppression) ---
-        
-        # 1. Sort by Area Descending (Largest = Best).
         paper_candidates.sort(key=lambda x: x['area'], reverse=True)
-        
         unique_papers = []
-        min_dist_sq = (frame.shape[0] * 0.1) ** 2  # Threshold: ~10% of screen height squared
+        min_dist_sq = (frame.shape[0] * 0.1) ** 2  
         
         for cand in paper_candidates:
             if len(unique_papers) >= 2: break 
-            
             is_duplicate = False
             c1 = np.array(cand['center'])
             for existing in unique_papers:
                 c2 = np.array(existing['center'])
                 if np.sum((c1 - c2) ** 2) < min_dist_sq:
-                    is_duplicate = True
-                    break 
-            
-            if not is_duplicate:
-                unique_papers.append(cand)
+                    is_duplicate = True; break 
+            if not is_duplicate: unique_papers.append(cand)
 
-        # 2. Assign Top/Bottom Slots (Vertical Split)
-        # CHANGED: Use Y-coordinate (height) to split instead of X
         screen_center_y = frame.shape[0] // 2
-        final_slots = [None, None] # [Top_Paper, Bottom_Paper]
+        final_slots = [None, None] 
 
         for paper in unique_papers:
-            # If center Y is higher (smaller value) than middle -> Top (Slot 0)
-            # Else -> Bottom (Slot 1)
             idx = 0 if paper['center'][1] < screen_center_y else 1
-            
-            if final_slots[idx] is None:
-                final_slots[idx] = paper['pts']
+            if final_slots[idx] is None: final_slots[idx] = paper['pts']
 
-        # 3. Process Stabilizers
         detected_papers = [] 
-        for i in range(2): # 0 = Top, 1 = Bottom
+        for i in range(2): 
             raw_corners = final_slots[i]
             stabilizer = self.paper_stabilizers[i]
             
             stable_corners = None
-            if raw_corners is not None:
-                stable_corners = stabilizer.update(raw_corners)
-            elif stabilizer.locked_coords is not None:
-                stable_corners = stabilizer.locked_coords
+            if raw_corners is not None: stable_corners = stabilizer.update(raw_corners)
+            elif stabilizer.locked_coords is not None: stable_corners = stabilizer.locked_coords
             
             if stable_corners is not None:
                 warped, box = warp_from_points(frame, stable_corners)
                 detected_papers.append(warped)
-                
                 cv2.drawContours(output_img, [box], 0, self.colors["paper"], 2)
                 cv2.drawContours(occupied_mask, [box], -1, 255, -1)
-                
                 label = "P1 (Top)" if i == 0 else "P2 (Bot)"
                 cv2.putText(output_img, label, (box[0][0], box[0][1]-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors["paper"], 2)
             else:
                 detected_papers.append(None)
-
         crops["papers"] = detected_papers
 
-        # --- STAGE 2: WHEEL (Contour Solidity Strategy) ---
-        
-        # 1. Color Masking (Same as before)
+        # --- STAGE 2: WHEEL ---
         mask_wheel = np.zeros(frame.shape[:2], dtype=np.uint8)
         target_colors = ["Yellow", "Purple", "Blue"]
         
@@ -427,104 +459,60 @@ class BoardDetector:
                 mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
                 mask_wheel = cv2.bitwise_or(mask_wheel, mask)
         
-        # 2. Subtract Papers & Clean
         mask_wheel = cv2.bitwise_and(mask_wheel, mask_wheel, mask=cv2.bitwise_not(occupied_mask))
         mask_wheel = cv2.morphologyEx(mask_wheel, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-        #cv2.imshow("Wheel Mask Debug", cv2.resize(mask_wheel, (0,0), fx=0.5, fy=0.5))
-
-        # 3. Solidity Filtering
-        # Find all individual blobs (triangles, noise, arm parts)
+        
         cnts_wheel, _ = cv2.findContours(mask_wheel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         valid_points = []
-        
         for cnt in cnts_wheel:
             area = cv2.contourArea(cnt)
-            if area < 500: continue # Ignore tiny noise
-            
+            if area < 500: continue 
             hull = cv2.convexHull(cnt)
             hull_area = cv2.contourArea(hull)
-            
             if hull_area > 0:
                 solidity = float(area) / hull_area
-                
-                # CRITICAL FILTER: 
-                # The wheel's colored triangles are solid geometric shapes (Solidity ~ 1.0).
-                # An arm/hand is irregular and has lower solidity.
-                if solidity > 0.85: 
-                    # This contour is likely a valid part of the wheel. Add its points.
-                    # We add the points from the convex hull to be safe/clean.
-                    valid_points.extend(hull.reshape(-1, 2))
+                if solidity > 0.85: valid_points.extend(hull.reshape(-1, 2))
 
-        # 4. Global Geometry Check
         raw_corners = None
-        
         if len(valid_points) > 0:
-            # Create a single array of all valid points
             all_pts = np.array(valid_points, dtype=np.int32)
-            
-            # Find the Convex Hull of the ENTIRE set of valid pieces
-            # This wraps all the triangles into one big shape (the Square of Fortune)
             master_hull = cv2.convexHull(all_pts)
-            
-            # Check if this master hull forms a Square
             peri = cv2.arcLength(master_hull, True)
             approx = cv2.approxPolyDP(master_hull, 0.04 * peri, True)
             
-            # Check for 4 corners
             if len(approx) == 4:
                 hull_area = cv2.contourArea(master_hull)
-            
-                # 2. Find the smallest possible rotated rectangle that fits the hull
-                # This is more robust than approxPolyDP for noisy shapes
                 rect = cv2.minAreaRect(master_hull)
                 (cx, cy), (w, h), angle = rect
                 rect_area = w * h
-                
                 if rect_area > 0:
-                    # 3. Solidity Check (Intersection over Union-like ratio)
-                    # How much of the rectangle is actually filled by the hull?
                     solidity = hull_area / rect_area
-                    
-                    # 4. Squareness Check (Aspect Ratio of the rotated box)
                     aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-                    
-                    # Validation: High solidity (>0.85) and nearly equal sides (<1.3)
                     if solidity > 0.80 and aspect_ratio < 1.3:
                         raw_corners = approx.reshape(4, 2).astype(np.float32)
                     else:
-                        # Convert rotated rect to 4 corner points
                         box = cv2.boxPoints(rect)
                         raw_corners = np.array(box, dtype=np.float32)
             else:
-                # Fallback: If approxPolyDP fails (e.g. 5 points due to a clipped corner),
-                # force a rectangle fit, but only if the shape is substantial.
                 rect = cv2.minAreaRect(master_hull)
                 w, h = rect[1]
                 if w > 0 and h > 0:
                     ar = min(w,h) / max(w,h)
-                    if 0.7 < ar < 1.3: # Still must be somewhat square
-                        raw_corners = cv2.boxPoints(rect)
+                    if 0.7 < ar < 1.3: raw_corners = cv2.boxPoints(rect)
 
-        # 5. Stabilization
         stable_corners = None
-        if raw_corners is not None:
-            stable_corners = self.wheel_stabilizer.update(raw_corners)
-        elif self.wheel_stabilizer.locked_coords is not None:
-            stable_corners = self.wheel_stabilizer.locked_coords
+        if raw_corners is not None: stable_corners = self.wheel_stabilizer.update(raw_corners)
+        elif self.wheel_stabilizer.locked_coords is not None: stable_corners = self.wheel_stabilizer.locked_coords
             
-        # 6. Extract & Update Mask
         if stable_corners is not None:
             warped, box = warp_from_points(frame, stable_corners)
             crops["wheel"] = warped
-            
             is_locked = (self.wheel_stabilizer.locked_coords is not None)
             color = self.colors["wheel"] if is_locked else (0, 255, 255) 
             cv2.drawContours(output_img, [box], 0, color, 3 if is_locked else 1)
             cv2.drawContours(occupied_mask, [box], -1, 255, -1)
             
         occupied_mask = cv2.dilate(occupied_mask, np.ones((15,15), np.uint8), iterations=2)
-        #cv2.imshow("Occupied Mask Debug", cv2.resize(occupied_mask, (0,0), fx=0.5, fy=0.5))
         
         # --- STAGE 3: CIRCLE ---
         gray_med = cv2.medianBlur(gray, 7)
@@ -540,14 +528,12 @@ class BoardDetector:
                     raw_circle_box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32)
                     break 
         
-        # Stabilize Circle
         if raw_circle_box is not None: stable_circle = self.circle_stabilizer.update(raw_circle_box)
         elif self.circle_stabilizer.locked_coords is not None: stable_circle = self.circle_stabilizer.locked_coords
         else: stable_circle = None
         
         if stable_circle is not None:
             x, y, w, h = cv2.boundingRect(stable_circle.astype(int))
-            # Safe crop bounds
             x, y = max(0, x), max(0, y)
             crops["circle"] = frame[y:y+h, x:x+w]
             cx, cy, r = x + w//2, y + h//2, max(w, h)//2
@@ -560,7 +546,6 @@ class BoardDetector:
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))  
         clusters = cv2.dilate(thresh, np.ones((9,9),np.uint8), iterations=3)     
         clusters = cv2.erode(clusters, np.ones((9,9),np.uint8), iterations=3)
-        cv2.imshow("Occupied Mask Debug", cv2.resize(clusters, (0,0), fx=0.5, fy=0.5)) 
         cnts, _ = cv2.findContours(clusters, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
         raw_sq_corners = None
@@ -572,7 +557,6 @@ class BoardDetector:
                 raw_sq_corners = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32)
                 break
         
-        # Stabilize Square
         if raw_sq_corners is not None: stable_sq = self.square_stabilizer.update(raw_sq_corners)
         elif self.square_stabilizer.locked_coords is not None: stable_sq = self.square_stabilizer.locked_coords
         else: stable_sq = None
@@ -585,7 +569,7 @@ class BoardDetector:
         return output_img, crops
 
 # ==========================================
-# 7. MAIN LOOP
+# 8. MAIN LOOP
 # ==========================================
 def process_video(input_path, output_path):
     cap = cv2.VideoCapture(input_path)
@@ -607,7 +591,6 @@ def process_video(input_path, output_path):
         detected_frame, crops = detector.detect_elements(frame)
         status_texts = []
         
-        # Only iterate over actual detected papers (up to 2)
         for i, paper_crop in enumerate(crops["papers"]):
             status_texts.append(manager.handle_paper(paper_crop, i))
             
@@ -634,7 +617,7 @@ def process_video(input_path, output_path):
     print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_4.MOV'
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_11.MOV' # Replace with your local path
     output_path = 'game_output.MOV'
     if os.path.exists(video_path): process_video(video_path, output_path)
     else: print(f"File not found: {video_path}")
