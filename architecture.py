@@ -385,8 +385,8 @@ class DiceAnalyzer:
                  if circ > 0.5:
                      final_count += 1
                      cv2.drawContours(viz, [cnt], -1, (0, 255, 0), 2)
-        if final_count in (2,4):
-            cv2.imshow(f"Papeeee Analysis", thresh_copy)
+        if final_count > 6:
+            final_count = 6
 
         return final_count, viz
 
@@ -833,7 +833,7 @@ def process_video(input_path, output_path):
     print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_11.MOV' # Replace with your local path
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_4.MOV' # Replace with your local path
     output_path = 'game_output.MOV'
     if os.path.exists(video_path): process_video(video_path, output_path)
     else: print(f"File not found: {video_path}")
