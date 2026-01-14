@@ -2,59 +2,64 @@ import cv2
 import numpy as np
 from collections import deque
 import os
-
-# ==========================================
-# 1. CONFIGURATION (Hyperparameters)
-# ==========================================
+ 
 class GameConfig:
-    """
-    Central configuration for all game detection parameters.
-    """
-    # --- Color Calibration (HSV: H=0-179, S=0-255, V=0-255) ---
+    # I put all the tweakable values here so I don't have to hunt for them in the code later.
+    
+    # HSV Color Ranges (H=0-179, S=0-255, V=0-255)
+    # These took a while to calibrate.
     COLOR_RANGES = {
-        "Red_1":   ((0, 20, 70), (10, 255, 255)),     
+        "Red_1":   ((0, 20, 70), (13, 255, 255)),     
         "Red_2":   ((170, 20, 70), (180, 255, 255)),  
-        "Yellow":  ((20, 20, 70), (35, 255, 255)),    
-        "Purple":  ((120, 10, 50), (145, 255, 255)),  
+        "Yellow":  ((20, 20, 70), (40, 255, 255)),    
+        "Purple":  ((110, 10, 50), (145, 255, 255)),  
         "Blue":    ((85, 20, 70), (115, 255, 255)),   
     }
 
-    # --- Token Colors & Points ---
+    # Token settings - points and colors
     TOKEN_COLORS = {
         "Blue":   {"range": ((37, 1, 70), (60, 255, 255)), "points": 1},
         "Green":  {"range": ((27, 20, 50), (37, 255, 255)),  "points": 5},
-        "Purple": {"range": ((154, 10, 40), (174, 255, 255)), "points": 10},
+        "Purple": {"range": ((125, 10, 40), (174, 255, 255)), "points": 10},
         "Orange": {"range": ((10, 90, 100), (27, 255, 255)), "points": 50} 
     }
     MIN_TOKEN_AREA_PCT = 0.02 
 
-    # --- Stabilizer Settings ---
+    # Stabilizer stuff - keeps the boxes from shaking
     STABILIZER_HISTORY_LEN = 60       
     STABILIZER_THRESHOLD = 4.0        
 
-    # --- Wheel Analysis Settings ---
+    # Wheel settings
     WHEEL_HISTORY_LEN = 15            
-    NEEDLE_VALUE_THRESH = 110         
     ROI_RADIUS = 20                   
-    MIN_VOTES = 5                     
+    MIN_VOTES = 3                     
 
-    # --- General Detection ---
+    # General detection thresholds
     MIN_CONTOUR_AREA = 5000           
     MIN_NEEDLE_AREA = 50 
     
-    # --- DICE DETECTION SETTINGS (NEW) ---
-    DICE_MIN_AREA = 100       # Min area for a die candidate
-    DICE_MAX_AREA = 1500      # Max area (relative to crop)
-    DICE_PIP_THRESH = 100      # Threshold for pip detection in warped image
-    DICE_PIP_MIN_AREA = 10     # Min area for a pip
-    DICE_PIP_MAX_AREA = 400    # Max area for a pip
+    # Dice settings
+    DICE_MIN_AREA = 100       
+    DICE_MAX_AREA = 1500      
+    DICE_PIP_THRESH = 100      
+    DICE_PIP_MIN_AREA = 10     
+    DICE_PIP_MAX_AREA = 400    
 
-# ==========================================
-# 2. HELPER FUNCTIONS
-# ==========================================
+    # Buffers to smooth out the detection so it doesn't flicker
+    PAPER_BUFFER_LEN = 30     
+    SQUARE_BUFFER_LEN = 7    
+    CIRCLE_BUFFER_LEN = 20    
+    THROW_LOGIC_FRAMES = 5    # How many empty frames before we decide they are throwing
+    
+    MESSAGE_DURATION = 40     
+    DASHBOARD_WIDTH = 550     
 
+
+# Utility functions
+
+# Sorts points: top-left, top-right, bottom-right, bottom-left
+# Needed for the perspective transform to work right.
 def order_points(pts):
-    """Orders coordinates: top-left, top-right, bottom-right, bottom-left."""
     pts = pts.reshape(4, 2).astype("float32")
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1); diff = np.diff(pts, axis=1)
@@ -62,14 +67,13 @@ def order_points(pts):
     rect[1] = pts[np.argmin(diff)]; rect[3] = pts[np.argmax(diff)]
     return rect
 
+# Cuts out the shape defined by pts and flattens it
 def warp_from_points(image, pts):
-    """Warps image based on 4 points."""
     sorted_pts = order_points(pts)
     (tl, tr, br, bl) = sorted_pts
     width = max(int(np.linalg.norm(br-bl)), int(np.linalg.norm(tr-tl)))
     height = max(int(np.linalg.norm(tr-br)), int(np.linalg.norm(tl-bl)))
     
-    # Safety check for zero dimension
     if width == 0: width = 1
     if height == 0: height = 1
         
@@ -77,11 +81,9 @@ def warp_from_points(image, pts):
     warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(sorted_pts, dst), (width, height))
     return warped, sorted_pts.astype(int)
 
-# ==========================================
-# 3. STABILIZER
-# ==========================================
-
 class CornerStabilizer:
+    # This class averages the coordinates over the last few frames.
+    # Without this, the detection boxes jitter too much.
     def __init__(self):
         self.history = deque(maxlen=GameConfig.STABILIZER_HISTORY_LEN)
         self.locked_coords = None
@@ -99,14 +101,11 @@ class CornerStabilizer:
         mean_coords = np.mean(history_arr, axis=0)
         max_deviation = np.max(np.linalg.norm(history_arr - mean_coords, axis=2))
         
+        # If the deviation is small, lock the coordinates so it looks stable
         if max_deviation < self.threshold:
             self.locked_coords = mean_coords.astype(np.float32)
             
         return self.locked_coords if self.locked_coords is not None else sorted_coords
-
-# ==========================================
-# 4. WHEEL ANALYZER
-# ==========================================
 
 class WheelAnalyzer:
     def __init__(self):
@@ -114,17 +113,24 @@ class WheelAnalyzer:
         self.color_history = deque(maxlen=self.history_len)
         self.current_state = "IDLE" 
 
+    # Tries to find the black needle on the wheel
     def find_outermost_tip(self, hsv_crop):
         h, w = hsv_crop.shape[:2]
         center = np.array([w // 2, h // 2])
+        v_channel = hsv_crop[:, :, 2]
+        mean_v = np.mean(v_channel)
+        threshold = int(mean_v*0.6)
+        if mean_v>200:
+            threshold = int(mean_v*0.8)
         lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, GameConfig.NEEDLE_VALUE_THRESH]) 
+        upper_black = np.array([180, 255, threshold]) 
         mask = cv2.inRange(hsv_crop, lower_black, upper_black)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=2)
-        
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8), iterations=2)
+
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts: return None, None
         
+        # Filter out noise
         valid_cnts = []
         for cnt in cnts:
             if cv2.contourArea(cnt) < GameConfig.MIN_NEEDLE_AREA: continue
@@ -142,13 +148,21 @@ class WheelAnalyzer:
         outermost_tip = points[np.argmax(dists)]
         return outermost_tip, needle_cnt
 
+    # Checks colors around the tip to see what we landed on
     def get_color_by_voting(self, hsv_crop, tip, debug_img=None):
         h, w = hsv_crop.shape[:2]
         radius = GameConfig.ROI_RADIUS
         mask_roi = np.zeros((h, w), dtype=np.uint8)
         cv2.circle(mask_roi, tuple(tip), radius, 255, -1)
-        
-        mask_black = cv2.inRange(hsv_crop, np.array([0,0,0]), np.array([180, 255, GameConfig.NEEDLE_VALUE_THRESH]))
+        if debug_img is not None:
+            cv2.circle(debug_img, tuple(tip), radius, 255, 2)
+        v_channel = hsv_crop[:, :, 2]
+        mean_v = np.mean(v_channel)
+        threshold = int(mean_v*0.6)
+        if mean_v>200:
+            threshold = int(mean_v*0.8)
+
+        mask_black = cv2.inRange(hsv_crop, np.array([0,0,0]), np.array([180, 255, threshold]))
         mask_grey = cv2.inRange(hsv_crop, np.array([0,0,0]), np.array([180, 50, 255]))
         mask_invalid = cv2.bitwise_or(mask_black, mask_grey)
         mask_valid = cv2.bitwise_and(mask_roi, cv2.bitwise_not(mask_invalid))
@@ -168,21 +182,35 @@ class WheelAnalyzer:
 
     def analyze(self, wheel_crop, debug_vis_img=None):
         if wheel_crop is None or wheel_crop.size == 0: return "No Wheel", "N/A"
+        
+        h, w = wheel_crop.shape[:2]
         hsv = cv2.cvtColor(wheel_crop, cv2.COLOR_BGR2HSV)
         tip, needle_cnt = self.find_outermost_tip(hsv)
         current_color = "Unknown"
         
+        # Boundary Fallback Strategy 
+        if tip is not None:
+            tx, ty = tip
+            border_margin = 5  # pixels from edge to consider "touching"
+            
+            # Check if tip is too close to any border
+            if (tx < border_margin or tx > w - border_margin or ty < border_margin or ty > h - border_margin):
+                tip = None 
+
         if tip is not None:
             if debug_vis_img is not None:
                 cv2.drawContours(debug_vis_img, [needle_cnt], -1, (255, 0, 255), 2)
                 cv2.circle(debug_vis_img, tuple(tip), 3, (0, 0, 255), -1)
             current_color = self.get_color_by_voting(hsv, tip, debug_vis_img)
 
+        # Buffer the results so it doesn't flip flop
         self.color_history.append(current_color)
         if len(self.color_history) < self.history_len: return "Initializing...", "N/A"
         valid = [c for c in self.color_history if c not in ["Unknown"]]
         if len(valid) < 5: return "Searching...", "N/A"
         unique = set(valid)
+        
+        # If we see multiple colors in recent history, it's spinning
         if len(unique) > 1:
             self.current_state = "SPINNING"
             return "SPINNING", "..."
@@ -194,16 +222,13 @@ class WheelAnalyzer:
             else:
                 return "IDLE", stable_col
 
-# ==========================================
-# 5. PAPER ANALYZER
-# ==========================================
-
 class PaperAnalyzer:
     def __init__(self):
         self.token_config = GameConfig.TOKEN_COLORS
         self.min_area_pct = GameConfig.MIN_TOKEN_AREA_PCT
         self.max_area_pct = 0.20 
         
+        # Aspect ratio for tokens (they are rectangular)
         self.target_ratio = 2.2
         self.ratio_tolerance = 0.3 
         self.min_solidity = 0.85
@@ -234,6 +259,7 @@ class PaperAnalyzer:
                 area = cv2.contourArea(cnt)
                 area_pct = area / paper_area
                 
+                # Check if size is reasonable
                 if self.min_area_pct <= area_pct <= self.max_area_pct:
                     rect = cv2.minAreaRect(cnt)
                     (cx, cy), (rw, rh), angle = rect
@@ -250,12 +276,14 @@ class PaperAnalyzer:
                     valid_ratio = (self.target_ratio - self.ratio_tolerance) < ar < (self.target_ratio + self.ratio_tolerance)
                     valid_solidity = solidity > self.min_solidity
 
+                    # Regular single token
                     if valid_solidity and valid_ratio:
                         total_score += points
                         cv2.drawContours(viz_crop, [box], 0, (0, 255, 0), 2)
                         cv2.putText(viz_crop, f"{points}pts", (box[1][0], box[1][1] - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+                    # Handle stacked tokens (using peaks distance transform)
                     elif solidity > self.min_solidity*0.9:
                         mask_roi = np.zeros_like(mask)
                         cv2.drawContours(mask_roi, [cnt], -1, 255, -1)
@@ -275,140 +303,91 @@ class PaperAnalyzer:
 
         return total_score, viz_crop
 
-# ==========================================
-# 6. DICE ANALYZER (No Resize & King Pip Filter)
-# ==========================================
-
 class DiceAnalyzer:
     def __init__(self):
-        # HSV Settings for "White" Dice
-        # Lower: Any Hue, Very Low Saturation, High Value (Brightness)
         self.lower_white = np.array([0, 0, 200]) 
         self.upper_white = np.array([180, 60, 255])
-        
-        # Kernels
         self.kernel_open = np.ones((3, 3), np.uint8)
         self.kernel_erode = np.ones((3, 3), np.uint8) 
 
+    # Extracts the die face and counts the pips (dots)
     def count_pips_in_warped(self, die_crop):
-        """
-        Counts pips using a 2-Pass Bounding Box Filter.
-        1. Upscale.
-        2. Detect all potential pips.
-        3. Identify "Major Pips" (Area >= 64% of Max Pip).
-        4. Create Bounding Box around Major Pips.
-        5. Mask out everything outside this box (removing boundary artifacts).
-        6. Re-count inside the box.
-        """
         if die_crop is None or die_crop.size == 0: return 0, die_crop
         
-        # 0. Debug Info
-        print(f"Pip Analysis Input Shape: {die_crop.shape}")
-
-        # 1. Upscale (4x) for sub-pixel accuracy
         scale = 4
         src = cv2.resize(die_crop, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        
-        # 2. Grayscale & Threshold (No Blur)
         gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        # 4. BOUNDARY CLEANUP (The "Frame" Killer)
-        #    Set a margin of pixels around the entire image to Black (0).
-        #    This slices off the white "rim" artifacts caused by the die's edge shadows.
+        
+        # Ignore borders
         h, w = thresh.shape
         margin = int(0.075*(np.sum(thresh.shape)))
-        cv2.rectangle(thresh, (0, 0), (w, margin), 0, -1)          # Top
-        cv2.rectangle(thresh, (0, h-margin), (w, h), 0, -1)        # Bottom
-        cv2.rectangle(thresh, (0, 0), (margin, h), 0, -1)          # Left
-        cv2.rectangle(thresh, (w-margin, 0), (w, h), 0, -1)        # Right
-        thresh_copy = thresh.copy()
-
-        # 3. Find Candidates (Pass 1)
-        cnts, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.rectangle(thresh, (0, 0), (w, margin), 0, -1)
+        cv2.rectangle(thresh, (0, h-margin), (w, h), 0, -1)
+        cv2.rectangle(thresh, (0, 0), (margin, h), 0, -1)
+        cv2.rectangle(thresh, (w-margin, 0), (w, h), 0, -1)
         
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         face_area = gray.shape[0] * gray.shape[1]
         candidates = []
         
+        # Filter for circular blobs
         for cnt in cnts:
             area = cv2.contourArea(cnt)
-            # Loose filter
             if (face_area * 0.002) < area < (face_area * 0.25):
                 peri = cv2.arcLength(cnt, True)
                 if peri == 0: continue
                 circ = 4 * np.pi * (area / (peri ** 2))
-                
-                if circ > 0.5: # Loose circularity
-                    candidates.append(cnt)
+                if circ > 0.5: candidates.append(cnt)
         
-        # Fallback if nothing found
         if not candidates: return 0, src
         
-        # 4. Find Major Pips (King Filter)
         max_area = max([cv2.contourArea(c) for c in candidates])
         major_thresh = 0.50 * max_area
-        
-        # These are the pips we are CONFIDENT belong to the face
         major_pips = [c for c in candidates if cv2.contourArea(c) >= major_thresh]
         
         if not major_pips: return 0, src
 
-        # 5. Define "Active Region" (Smallest Bounding Box)
-        # We assume Major Pips define the "face area".
+        # Focus on the area with pips
         all_points = np.vstack(major_pips)
         x, y, w, h = cv2.boundingRect(all_points)
-        
-        # 6. Masking (The Boundary Killer)
-        # Create a mask that is BLACK everywhere ...
         mask_roi = np.zeros_like(thresh)
-        # ... except inside the bounding box (WHITE)
         cv2.rectangle(mask_roi, (x, y), (x + w, y + h), 255, -1)
-        
-        # Apply mask: This keeps pixels inside the box, effectively
-        # removing any "white border artifacts" that are outside this cluster.
         thresh_clean = cv2.bitwise_and(thresh, thresh, mask=mask_roi)
         
-        # 7. Final Count (Pass 2)
         cnts_final, _ = cv2.findContours(thresh_clean, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        
         final_count = 0
         viz = src.copy()
         
         for cnt in cnts_final:
             area = cv2.contourArea(cnt)
-            # Basic noise check (min area)
             if area > (face_area * 0.002):
                  peri = cv2.arcLength(cnt, True)
                  if peri == 0: continue
                  circ = 4 * np.pi * (area / (peri ** 2))
-                 
-                 # Accept any circular shape inside the valid box
                  if circ > 0.5:
                      final_count += 1
                      cv2.drawContours(viz, [cnt], -1, (0, 255, 0), 2)
-        if final_count > 6:
-            final_count = 6
-
+        if final_count > 6: final_count = 6
         return final_count, viz
 
+    # Main function to find dice in the container crop
     def analyze(self, crop, container_type, debug_img=None):
-        """
-        Main detection pipeline.
-        """
         if crop is None or crop.size == 0: return []
         scores = []
         h, w = crop.shape[:2]
         
-        # --- STAGE 1: COLOR SEGMENTATION (Find White Objects) ---
-        # Median blur is great for ignoring fabric texture while keeping edges sharp
         blurred_crop = cv2.medianBlur(crop, 7)
         hsv = cv2.cvtColor(blurred_crop, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(blurred_crop, cv2.COLOR_BGR2GRAY)
+        lower = self.lower_white
+        if np.mean(gray)<100:
+            lower = np.array([0, 0, 130])
+        if np.mean(gray)<75:
+            lower = np.array([0, 0, 100]) 
+        white_mask = cv2.inRange(hsv, lower, self.upper_white)
         
-        # Create White Mask
-        white_mask = cv2.inRange(hsv, self.lower_white, self.upper_white)
-        
-        # --- STAGE 2: GEOMETRY CLEANUP (The Fix) ---
-        
-        # 1. Circle ROI (Still useful to mask strictly outside the circle)
+        # Mask out outside areas based on shape
         if container_type == "Circle":
             roi_mask = np.zeros((h, w), dtype=np.uint8)
             center = (w // 2, h // 2)
@@ -416,134 +395,185 @@ class DiceAnalyzer:
             cv2.circle(roi_mask, center, int(radius * 0.85), 255, -1)
             white_mask = cv2.bitwise_and(white_mask, white_mask, mask=roi_mask)
             
-        # 2. Square: No harsh masking, just a tiny 2px border clean
-        #    This prevents infinite lines if the crop hits the very edge of the image.
         elif container_type == "Square":
-            cv2.rectangle(white_mask, (0,0), (w, 2), 0, -1) # Top
-            cv2.rectangle(white_mask, (0,h-2), (w, h), 0, -1) # Bot
-            cv2.rectangle(white_mask, (0,0), (2, h), 0, -1) # Left
-            cv2.rectangle(white_mask, (w-2,0), (w, h), 0, -1) # Right
+            cv2.rectangle(white_mask, (0,0), (w, 2), 0, -1) 
+            cv2.rectangle(white_mask, (0,h-2), (w, h), 0, -1) 
+            cv2.rectangle(white_mask, (0,0), (2, h), 0, -1) 
+            cv2.rectangle(white_mask, (w-2,0), (w, h), 0, -1) 
         
-        # 3. Erosion (Critical):
-        #    If a die is touching the bright metal rim, they will merge into one blob.
-        #    Eroding breaks this thin connection.
+        # Clean up noise
         white_mask = cv2.erode(white_mask, self.kernel_erode, iterations=2)
-        
-        # 4. Open (Noise Removal)
         white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, self.kernel_open, iterations=1)
-        
-        # 5. Dilate (Restore Size)
-        #    We dilate back to get the original die shape, but the connection to the rim is now broken.
         white_mask = cv2.dilate(white_mask, self.kernel_erode, iterations=2)
 
-        # Visualize Mask
         if debug_img is not None:
              mask_vis = cv2.cvtColor(white_mask, cv2.COLOR_GRAY2BGR)
              mask_vis = cv2.resize(mask_vis, (80, 80))
              debug_img[0:80, 0:80] = mask_vis
 
-        # --- STAGE 3: CONTOUR ANALYSIS ---
         cnts, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for cnt in cnts:
             area = cv2.contourArea(cnt)
+            if area < GameConfig.DICE_MIN_AREA or area > GameConfig.DICE_MAX_AREA: continue
             
-            # Filter 1: Area
-            # Dice are usually 1000-15000px depending on camera height.
-            # Rims are usually HUGE (perimeter of image) or tiny (noise).
-            if area < GameConfig.DICE_MIN_AREA or area > GameConfig.DICE_MAX_AREA:
-                continue
-            
-            # Filter 2: Solidity (The Rim Killer)
-            # A die is a solid square (Solidity ~0.95).
-            # A metal rim is a hollow loop (Solidity < 0.3) or a thin line.
             hull = cv2.convexHull(cnt)
             hull_area = cv2.contourArea(hull)
             solidity = float(area) / hull_area if hull_area > 0 else 0
             
             if solidity < 0.80: continue 
             
-            # Filter 3: Aspect Ratio
             rect = cv2.minAreaRect(cnt)
             (cx, cy), (rw, rh), angle = rect
             
             if min(rw, rh) == 0: continue
             ar = max(rw, rh) / min(rw, rh)
-            
-            # Dice are square-ish. Rims are often long and thin.
             if ar > 1.35: continue 
 
-            # Get Detection Box
             box = cv2.boxPoints(rect)
             box = np.intp(box)
-            
-            # --- STAGE 4: WARP & COUNT ---
             warped_die, _ = warp_from_points(crop, box.astype(np.float32))
-            
-            # REMOVED: Resizing step to keep original detail for pip counting
-            # warped_die = cv2.resize(warped_die, (100, 100))
-            
             pips, pip_viz = self.count_pips_in_warped(warped_die)
             
-            if True:#1 <= pips:
-                #if pips > 6:
-                #    pips = 6
+            if True:
                 scores.append(pips)
-                
                 if debug_img is not None:
-                    # Draw Green Box
                     cv2.drawContours(debug_img, [box], 0, (0, 255, 0), 2)
-                    # Draw Score
                     cv2.putText(debug_img, str(pips), (int(cx)-10, int(cy)+10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         return scores
 
-# ==========================================
-# 7. GAME STATE MANAGER
-# ==========================================
-
 class GameStateManager:
     def __init__(self):
-        self.scores = {"Paper_1": 0, "Paper_2": 0}
         self.wheel_analyzer = WheelAnalyzer()
         self.paper_analyzer = PaperAnalyzer()
-        self.dice_analyzer = DiceAnalyzer() # Initialize the new DiceAnalyzer
+        self.dice_analyzer = DiceAnalyzer() 
+        
+        # Buffers to stop values from flickering
+        self.buffers = {
+            "Paper_1": deque(maxlen=GameConfig.PAPER_BUFFER_LEN),
+            "Paper_2": deque(maxlen=GameConfig.PAPER_BUFFER_LEN),
+            "Square_Dice": deque(maxlen=GameConfig.SQUARE_BUFFER_LEN),
+            "Circle_Dice": deque(maxlen=GameConfig.CIRCLE_BUFFER_LEN)
+        }
+        
+        # History for detecting throws
+        self.square_score_history = deque(maxlen=GameConfig.THROW_LOGIC_FRAMES)
+
+        # The "Confirmed" values we show on screen
+        self.stable_state = {
+            "Paper_1": 0,
+            "Paper_2": 0,
+            "Square_Dice": 0, 
+            "Circle_Dice": 0,
+            "Wheel": "IDLE"
+        }
+
+        # Event message stuff
+        self.current_message = ""
+        self.message_timer = 0
+        self.prev_wheel_state = "IDLE"
+
+    # Only returns a value if the buffer is full of the same number
+    def get_stable_value(self, key):
+        q = self.buffers[key]
+        if len(q) < q.maxlen: return None # Wait for buffer to fill
+        
+        first = q[0]
+        if all(x == first for x in q):
+            return first
+        return None
+
+    def trigger_event(self, text):
+        self.current_message = text
+        self.message_timer = GameConfig.MESSAGE_DURATION
 
     def handle_paper(self, crop, paper_index):
         if crop is None: 
             return f"Paper {paper_index + 1}: Not Found"
             
         score, viz_crop = self.paper_analyzer.analyze(crop)
-        self.scores[f"Paper_{paper_index+1}"] = score
+        
+        # 1. Add to buffer
+        key = f"Paper_{paper_index+1}"
+        self.buffers[key].append(score)
+        
+        # 2. Check if stable
+        stable_val = self.get_stable_value(key)
+        
+        # 3. If score changed, trigger event
+        if stable_val is not None:
+            prev_val = self.stable_state[key]
+            if stable_val != prev_val:
+                self.stable_state[key] = stable_val
+                loc = "Top" if paper_index == 0 else "Down"
+                self.trigger_event(f"Points were assigned to Paper {paper_index+1} ({loc})")
+
         cv2.imshow(f"Paper {paper_index + 1} Analysis", viz_crop)
-        return f"Paper {paper_index + 1}: {score}"
+        display_score = self.stable_state[key]
+        return f"Paper {paper_index + 1}: {display_score}"
 
     def handle_wheel(self, crop):
         debug_vis = crop.copy()
         state, color = self.wheel_analyzer.analyze(crop, debug_vis)
         
         vis_large = cv2.resize(debug_vis, (300, 300))
-        cv2.imshow("Wheel Analysis Debug", vis_large)
+        cv2.imshow("Wheel Analysis", vis_large)
+        
+        if state == "SPINNING" and self.prev_wheel_state != "SPINNING":
+            self.trigger_event("The player is randomizing the multiplier")
+        
+        elif state == "STOPPED" and self.prev_wheel_state == "SPINNING":
+            self.trigger_event("The Square of Fortune has stopped")
+            
+        self.prev_wheel_state = state
+        self.stable_state["Wheel"] = state
         
         txt = f"Wheel: {state}"
         if state in ["STOPPED", "IDLE"]: txt += f" -> {color}"
         return txt
 
+    # Deals with both square and circle containers
     def handle_container(self, crop, type_name):
-        """
-        Handles Circle and Square containers to detect dice.
-        type_name: "Circle" or "Square"
-        """
         if crop is None or crop.size == 0: return f"{type_name}: No Crop"
         
         debug_vis = crop.copy()
-        
-        # Call the new dice analyzer
-        # type_name determines the masking strategy
         dice_scores = self.dice_analyzer.analyze(crop, type_name, debug_vis)
+        count = len(dice_scores)
         
-        # Show debug view
+        # Logic for throwing detection (only for the square)
+        if type_name == "Square":
+            self.square_score_history.append(dice_scores)
+            
+            if len(self.square_score_history) == self.square_score_history.maxlen:
+                # If we see 0 scores for a few frames, they are probably throwing
+                is_throwing = all(sum(frame_scores) == 0 for frame_scores in self.square_score_history)
+                
+                if is_throwing and self.current_message != "The player is throwing dices":
+                    self.trigger_event("The player is throwing dices")
+
+        # 1. Update Buffer
+        key = f"{type_name}_Dice" 
+        self.buffers[key].append(count)
+        
+        # 2. Check Stability
+        stable_count = self.get_stable_value(key)
+        
+        if stable_count is not None:
+            prev_count = self.stable_state[key]
+            
+            # If dice count increases in the circle, they deposited something
+            if key == "Circle_Dice" and prev_count < stable_count:
+                self.trigger_event("Player locked some dices in a deposit for later")
+                
+            self.stable_state[key] = stable_count
+            
+            # Fallback throw logic
+            if type_name == "Square" and stable_count == 0:
+                 if self.current_message != "The player is throwing dices":
+                     self.trigger_event("The player is throwing dices")
+
         cv2.imshow(f"{type_name} Analysis", debug_vis)
         
         if not dice_scores:
@@ -551,10 +581,86 @@ class GameStateManager:
         else:
             return f"{type_name} Dice: {dice_scores}"
 
-# ==========================================
-# 8. BOARD DETECTOR (2-Player Logic)
-# ==========================================
+    # Draws the middle dashboard panel with all the info
+    def create_dashboard(self, height):
+        width = GameConfig.DASHBOARD_WIDTH
+        panel = np.zeros((height, width, 3), dtype=np.uint8)
+        # Dark Gray Background
+        panel[:] = (40, 40, 40)
+        
+        # Colors
+        c_title = (100, 200, 255) # Light Orange
+        c_text = (200, 200, 200) # Light Gray
+        c_event = (0, 100, 255)  # Orange for events
+        
+        # Helper to draw text centered
+        def draw_centered(text, y, scale=1.1, color=c_text, thick=2):
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)[0]
+            text_x = (width - text_size[0]) // 2
+            cv2.putText(panel, text, (text_x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
 
+        # --- HEADER ---
+        draw_centered("GAME DASHBOARD", 60, 1.5, c_title, 3)
+        cv2.line(panel, (20, 90), (width-20, 90), (100, 100, 100), 3)
+        
+        # --- STATS ---
+        y_cur = 150
+        # Paper Stats
+        draw_centered(f"Paper 1: {self.stable_state['Paper_1']}", y_cur)
+        y_cur += 50
+        draw_centered(f"Paper 2: {self.stable_state['Paper_2']}", y_cur)
+        y_cur += 80
+        
+        cv2.line(panel, (50, y_cur), (width-50, y_cur), (80, 80, 80), 1)
+        y_cur += 60
+        
+        # Dice Stats
+        draw_centered(f"Square Dice: {self.stable_state['Square_Dice']}", y_cur)
+        y_cur += 50
+        draw_centered(f"Circle Dice: {self.stable_state['Circle_Dice']}", y_cur)
+        y_cur += 80
+        
+        cv2.line(panel, (50, y_cur), (width-50, y_cur), (80, 80, 80), 1)
+        y_cur += 60
+        
+        # Wheel Stats
+        wheel_state = self.stable_state["Wheel"]
+        draw_centered(f"Wheel: {wheel_state}", y_cur)
+        
+        # --- EVENTS SECTION ---
+        y_cur += 120
+        # Draw background for events
+        cv2.rectangle(panel, (10, y_cur), (width-10, height-20), (20, 20, 20), -1)
+        draw_centered("EVENT LOG", y_cur + 40, 1.2, (150, 150, 150), 2) 
+        
+        if self.message_timer > 0:
+            self.message_timer -= 1
+            msg = self.current_message
+            
+            # Simple word wrap so text doesn't go off screen
+            words = msg.split(' ')
+            lines = []
+            curr_line = ""
+            for word in words:
+                test_line = curr_line + word + " "
+                if cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 2)[0][0] < (width - 40):
+                    curr_line = test_line
+                else:
+                    lines.append(curr_line)
+                    curr_line = word + " "
+            lines.append(curr_line)
+            
+            text_y = y_cur + 100
+            for line in lines:
+                draw_centered(line, text_y, 1.1, c_event, 2)
+                text_y += 50 
+        else:
+            draw_centered("Waiting...", y_cur + 100, 0.9, (80, 80, 80), 1)
+            
+        return panel
+
+
+# BOARD DETECTOR - Detect main elements which constitute board
 class BoardDetector:
     def __init__(self):
         self.colors = {
@@ -575,7 +681,8 @@ class BoardDetector:
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
         
-        # --- STAGE 1: PAPERS ---
+        # STAGE 1: FIND PAPERS 
+        # Looking manualy for bright pixels
         lower_white = np.array([0, 0, 160]) 
         upper_white = np.array([180, 60, 255])
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
@@ -585,6 +692,7 @@ class BoardDetector:
         mask_white = cv2.dilate(mask_white, kernel, iterations=1)
         cnts_white, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # Complementary Canny edge detection for changing lighting 
         v = np.median(blur)
         lower_canny = int(max(0, 0.67 * v))
         upper_canny = int(min(255, 1.33 * v))
@@ -601,6 +709,7 @@ class BoardDetector:
                 peri = cv2.arcLength(hull, True)
                 approx = cv2.approxPolyDP(hull, 0.04 * peri, True)
                 
+                # Looking for rectangles
                 if len(approx) == 4:
                     pts = approx.reshape(4, 2).astype(np.float32)
                     d1 = np.linalg.norm(pts[0]-pts[1]); d2 = np.linalg.norm(pts[1]-pts[2])
@@ -619,6 +728,7 @@ class BoardDetector:
                             'center': (x + w//2, y + h//2)
                         })
 
+        # Sort by area and remove duplicates that are too close
         paper_candidates.sort(key=lambda x: x['area'], reverse=True)
         unique_papers = []
         min_dist_sq = (frame.shape[0] * 0.1) ** 2  
@@ -633,6 +743,7 @@ class BoardDetector:
                     is_duplicate = True; break 
             if not is_duplicate: unique_papers.append(cand)
 
+        # Decide which is top (P1) and bottom (P2)
         screen_center_y = frame.shape[0] // 2
         final_slots = [None, None] 
 
@@ -654,14 +765,14 @@ class BoardDetector:
                 detected_papers.append(warped)
                 cv2.drawContours(output_img, [box], 0, self.colors["paper"], 2)
                 cv2.drawContours(occupied_mask, [box], -1, 255, -1)
-                label = "P1 (Top)" if i == 0 else "P2 (Bot)"
+                label = "P1 (Top)" if i == 0 else "P2 (Down)"
                 cv2.putText(output_img, label, (box[0][0], box[0][1]-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors["paper"], 2)
             else:
                 detected_papers.append(None)
         crops["papers"] = detected_papers
 
-        # --- STAGE 2: WHEEL ---
+        # STAGE 2: FINDING  WHEEL
         mask_wheel = np.zeros(frame.shape[:2], dtype=np.uint8)
         target_colors = ["Yellow", "Purple", "Blue"]
         
@@ -670,7 +781,8 @@ class BoardDetector:
                 lower, upper = GameConfig.COLOR_RANGES[color_name]
                 mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
                 mask_wheel = cv2.bitwise_or(mask_wheel, mask)
-        
+
+        # Don't look where we already found papers
         mask_wheel = cv2.bitwise_and(mask_wheel, mask_wheel, mask=cv2.bitwise_not(occupied_mask))
         mask_wheel = cv2.morphologyEx(mask_wheel, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
         
@@ -681,7 +793,10 @@ class BoardDetector:
             if area < 500: continue 
             hull = cv2.convexHull(cnt)
             hull_area = cv2.contourArea(hull)
-            if hull_area > 0:
+            rect = cv2.minAreaRect(cnt)
+            width, height = rect[1]
+            rect_area = width * height
+            if hull_area > 0 and hull_area/rect_area < 0.7:
                 solidity = float(area) / hull_area
                 if solidity > 0.85: valid_points.extend(hull.reshape(-1, 2))
 
@@ -726,7 +841,7 @@ class BoardDetector:
             
         occupied_mask = cv2.dilate(occupied_mask, np.ones((15,15), np.uint8), iterations=2)
         
-        # --- STAGE 3: CIRCLE ---
+        # STAGE 3: FIND CIRCLE 
         gray_med = cv2.medianBlur(gray, 7)
         circles = cv2.HoughCircles(gray_med, cv2.HOUGH_GRADIENT, dp=1.5, minDist=100,
                                    param1=50, param2=30, minRadius=120, maxRadius=250)
@@ -752,12 +867,15 @@ class BoardDetector:
             cv2.circle(output_img, (cx, cy), r, self.colors["circle"], 3)
             cv2.circle(occupied_mask, (cx, cy), int(r+20), 255, -1)
 
-        # --- STAGE 4: SQUARE ---
+        # STAGE 4: FIND SQUARE
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 3)
         thresh = cv2.bitwise_and(thresh, thresh, mask=cv2.bitwise_not(occupied_mask))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))  
+        cv2.imshow(f"Initial Thresholding", thresh)
+
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))  
         clusters = cv2.dilate(thresh, np.ones((9,9),np.uint8), iterations=3)     
         clusters = cv2.erode(clusters, np.ones((9,9),np.uint8), iterations=3)
+        cv2.imshow(f"After Heavy Closing", clusters)
         cnts, _ = cv2.findContours(clusters, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
         raw_sq_corners = None
@@ -780,9 +898,8 @@ class BoardDetector:
 
         return output_img, crops
 
-# ==========================================
-# 9. MAIN LOOP
-# ==========================================
+
+# MAIN
 def process_video(input_path, output_path):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened(): print(f"Error: {input_path}"); return
@@ -790,7 +907,11 @@ def process_video(input_path, output_path):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width * 2, height))
+    
+    # Increase Output Width to fit the middle panel
+    panel_width = GameConfig.DASHBOARD_WIDTH
+    out_width = (width * 2) + panel_width
+    out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, height))
 
     detector = BoardDetector()
     manager = GameStateManager()
@@ -803,37 +924,41 @@ def process_video(input_path, output_path):
         detected_frame, crops = detector.detect_elements(frame)
         status_texts = []
         
+        # 1. Update Managers and Detectors
         for i, paper_crop in enumerate(crops["papers"]):
             status_texts.append(manager.handle_paper(paper_crop, i))
             
         if crops["wheel"] is not None:
             status_texts.append(manager.handle_wheel(crops["wheel"]))
             
-        # Updated to process dice in Square
         if crops["hollow_square"] is not None:
             status_texts.append(manager.handle_container(crops["hollow_square"], "Square"))
             
-        # Updated to process dice in Circle
         if crops["circle"] is not None:
             status_texts.append(manager.handle_container(crops["circle"], "Circle"))
 
+        # 2. Draw standard status texts on the right-most frame (Detected Frame)
         y_offset = 40
         for text in status_texts:
             cv2.putText(detected_frame, text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             y_offset += 40
 
-        final_output = np.hstack((frame, detected_frame))
+        # 3. Create Middle Dashboard Panel
+        dashboard_panel = manager.create_dashboard(height)
+
+        # 4. Combine: [Original] | [Dashboard] | [Detected]
+        final_output = np.hstack((frame, dashboard_panel, detected_frame))
+
         out.write(final_output)
         
-        preview = cv2.resize(final_output, (0,0), fx=0.4, fy=0.4)
+        preview = cv2.resize(final_output, (0,0), fx=0.35, fy=0.35)
         cv2.imshow("Game Tracker", preview)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release(); out.release(); cv2.destroyAllWindows()
-    print("Done.")
 
 if __name__ == "__main__":
-    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/vid_4.MOV' # Replace with your local path
-    output_path = 'game_output.MOV'
-    if os.path.exists(video_path): process_video(video_path, output_path)
-    else: print(f"File not found: {video_path}")
+    video_path = '/home/jakub/Artificial Intelligence/Studies/Term 5/[CV] Computer Vision/boardgame-detecor/data/short_testing_videos/medium_2.MOV' 
+    output_path = 'output.MOV'
+    if os.path.exists(video_path): 
+        process_video(video_path, output_path)
